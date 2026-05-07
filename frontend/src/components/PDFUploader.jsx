@@ -6,6 +6,7 @@ import PdfExtractor from './modes/PdfExtractor';
 import PdfToImages from './modes/PdfToImages';
 import MathpixExtractor from './modes/MathpixExtractor';
 import ValidateQA from './modes/ValidateQA';
+import SinglePdf from './modes/SinglePdf';
 import './PDFUploader.css';
 
 const PDFUploader = () => {
@@ -17,6 +18,7 @@ const PDFUploader = () => {
   // const [qaExcel, setQaExcel] = useState(null);
   // const [agentId, setAgentId] = useState('');
   // const [deploymentSlug, setDeploymentSlug] = useState('');
+  const [singlePdf, setSinglePdf] = useState(null);
   const [mathpixModel, setMathpixModel] = useState('text');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -82,6 +84,7 @@ const PDFUploader = () => {
     setQuestionsPdf(null);
     setAnswersPdf(null);
     setExcelFile(null);
+    setSinglePdf(null);
     // setQaExcel(null);
   };
 
@@ -97,6 +100,19 @@ const PDFUploader = () => {
   };
 
   // ── API handlers (mode-specific logic) ─────────────────────────────────────
+
+  const handleSinglePdfExtract = async () => {
+    const fd = new FormData();
+    fd.append('pdf', singlePdf);
+    fd.append('model', 'sonnet');
+
+    const res = await fetch('/api/extract-single', { method: 'POST', body: fd });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to extract Q&A');
+    }
+    triggerDownload(await res.blob(), 'single_pdf_output.xlsx');
+  };
 
   const handleExtract = async () => {
     const fd = new FormData();
@@ -194,6 +210,10 @@ const PDFUploader = () => {
 
   const handleSubmit = async () => {
     // Validation
+    if (mode === 'single-pdf' && !singlePdf) {
+      setError('Please select a PDF file.');
+      return;
+    }
     if ((mode === 'extract' || mode === 'pdf-to-images' || mode === 'mathpix') && (!questionsPdf || !answersPdf)) {
       setError('Please select both PDF files.');
       return;
@@ -217,7 +237,8 @@ const PDFUploader = () => {
 
     try {
       // Route to appropriate handler based on mode
-      if (mode === 'extract') await handleExtract();
+      if (mode === 'single-pdf') await handleSinglePdfExtract();
+      else if (mode === 'extract') await handleExtract();
       else if (mode === 'pdf-to-images') await handlePdfToImages();
       else if (mode === 'mathpix') await handleMathpixExtract();
       else if (mode === 'validate') await handleValidate();
@@ -237,7 +258,9 @@ const PDFUploader = () => {
   // ── Compute canSubmit logic ────────────────────────────────────────────────
 
   const canSubmit =
-    (mode === 'extract' || mode === 'pdf-to-images' || mode === 'mathpix')
+    mode === 'single-pdf'
+      ? !!singlePdf
+      : (mode === 'extract' || mode === 'pdf-to-images' || mode === 'mathpix')
       ? !!(questionsPdf && answersPdf)
       : mode === 'validate'
       ? !!(questionsPdf && answersPdf && excelFile)
@@ -253,6 +276,18 @@ const PDFUploader = () => {
   return (
     <div className="uploader-container">
       <ModeSelector mode={mode} loading={loading} onModeChange={handleModeChange} />
+
+      {mode === 'single-pdf' && (
+        <SinglePdf
+          pdf={singlePdf}
+          loading={loading}
+          error={error}
+          success={success}
+          onPdfChange={(e) => handlePdfChange(e, 'PDF', setSinglePdf)}
+          onSubmit={handleSubmit}
+          canSubmit={canSubmit}
+        />
+      )}
 
       {mode === 'extract' && (
         <PdfExtractor

@@ -3,6 +3,7 @@ import './ModeSelector.css';
 
 const ModeSelector = ({ mode, loading, onModeChange }) => {
   const modes = [
+    { id: 'single-pdf', label: 'Single PDF Extract' },
     { id: 'extract', label: 'Extract Q&A' },
     { id: 'pdf-to-images', label: 'PDF to Images' },
     { id: 'mathpix', label: 'Extract (Mathpix)' },

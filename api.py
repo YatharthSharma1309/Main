@@ -511,6 +511,43 @@ def pdf_to_images():
                 pass
 
 
+@app.route('/api/extract-single', methods=['POST'])
+def extract_single():
+    pdf_path = None
+    try:
+        if 'pdf' not in request.files or request.files['pdf'].filename == '':
+            return jsonify({"error": "Missing required file: 'pdf'"}), 400
+        pdf_file = request.files['pdf']
+        if not allowed_file(pdf_file.filename):
+            return jsonify({"error": "Only PDF files are allowed"}), 400
+
+        model = request.form.get("model", "sonnet")
+        pdf_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(pdf_file.filename))
+        pdf_file.save(pdf_path)
+
+        questions_dir, figures_dir = _prepare_work_dirs(os.getcwd())
+        crop_by_qnum, mapping = _run_pdf_pipeline(pdf_path, pdf_path, questions_dir, figures_dir)
+        result = _transcribe_all_parallel(mapping, crop_by_qnum, model)
+
+        output_excel = os.path.join(app.config['UPLOAD_FOLDER'], 'single_pdf_output.xlsx')
+        _write_questions_excel(result, output_excel)
+
+        return send_file(
+            output_excel,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name='single_pdf_output.xlsx',
+        )
+    except Exception as e:
+        return jsonify({"error": f"Processing error: {str(e)}"}), 500
+    finally:
+        try:
+            if pdf_path and os.path.exists(pdf_path):
+                os.remove(pdf_path)
+        except Exception:
+            pass
+
+
 def _transcribe_entry_mathpix(entry: dict, crop_by_qnum: dict, model: str) -> dict:
     crop_path = crop_by_qnum.get(entry["question_num"])
     figs = entry.get("figure") or []
