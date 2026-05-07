@@ -20,6 +20,7 @@ const PDFUploader = () => {
   // const [deploymentSlug, setDeploymentSlug] = useState('');
   const [singlePdf, setSinglePdf] = useState(null);
   const [mathpixModel, setMathpixModel] = useState('text');
+  const [pdfToImagesModel, setPdfToImagesModel] = useState('sonnet');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(false);
@@ -170,6 +171,7 @@ const PDFUploader = () => {
     const fd = new FormData();
     fd.append('questions_pdf', questionsPdf);
     fd.append('answers_pdf', answersPdf || questionsPdf);
+    fd.append('model', pdfToImagesModel);
 
     const res = await fetch('/api/pdf-to-images', { method: 'POST', body: fd });
     if (!res.ok) {
@@ -309,6 +311,7 @@ const PDFUploader = () => {
         <PdfToImages
           questionsPdf={questionsPdf}
           answersPdf={answersPdf}
+          model={pdfToImagesModel}
           loading={loading}
           error={error}
           success={success}
@@ -317,6 +320,7 @@ const PDFUploader = () => {
             if (fileType === 'questions') handlePdfChange(e, setQuestionsPdf, label);
             else handlePdfChange(e, setAnswersPdf, label);
           }}
+          onModelChange={setPdfToImagesModel}
           onSubmit={handleSubmit}
           canSubmit={canSubmit}
         />
