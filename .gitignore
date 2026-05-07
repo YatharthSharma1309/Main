@@ -35,3 +35,5 @@ output/
 .vscode/
 node_modules/
 n8n_workflow.json
+figures/
+questions/
