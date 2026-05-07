@@ -55,7 +55,7 @@ const MathpixExtractor = ({
       </div>
 
       <div className="file-input-group">
-        <label htmlFor="mathpix-answers">Answers PDF *</label>
+        <label htmlFor="mathpix-answers">Answers PDF <span style={{fontWeight:'normal',color:'#888'}}>(optional — uses questions PDF if omitted)</span></label>
         <input
           ref={answersInputRef}
           id="mathpix-answers"

@@ -38,7 +38,7 @@ const PdfExtractor = ({
       </div>
 
       <div className="file-input-group">
-        <label htmlFor="answers">Answers PDF *</label>
+        <label htmlFor="answers">Answers PDF <span style={{fontWeight:'normal',color:'#888'}}>(optional — uses questions PDF if omitted)</span></label>
         <input
           ref={answersInputRef}
           id="answers"

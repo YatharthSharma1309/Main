@@ -117,7 +117,7 @@ const PDFUploader = () => {
   const handleExtract = async () => {
     const fd = new FormData();
     fd.append('questions_pdf', questionsPdf);
-    fd.append('answers_pdf', answersPdf);
+    fd.append('answers_pdf', answersPdf || questionsPdf);
 
     const res = await fetch('/api/extract', { method: 'POST', body: fd });
     if (!res.ok) {
@@ -155,7 +155,7 @@ const PDFUploader = () => {
   const handleMathpixExtract = async () => {
     const fd = new FormData();
     fd.append('questions_pdf', questionsPdf);
-    fd.append('answers_pdf', answersPdf);
+    fd.append('answers_pdf', answersPdf || questionsPdf);
     fd.append('model', mathpixModel);
 
     const res = await fetch('/api/extract-mathpix', { method: 'POST', body: fd });
@@ -169,7 +169,7 @@ const PDFUploader = () => {
   const handlePdfToImages = async () => {
     const fd = new FormData();
     fd.append('questions_pdf', questionsPdf);
-    fd.append('answers_pdf', answersPdf);
+    fd.append('answers_pdf', answersPdf || questionsPdf);
 
     const res = await fetch('/api/pdf-to-images', { method: 'POST', body: fd });
     if (!res.ok) {
@@ -214,8 +214,8 @@ const PDFUploader = () => {
       setError('Please select a PDF file.');
       return;
     }
-    if ((mode === 'extract' || mode === 'pdf-to-images' || mode === 'mathpix') && (!questionsPdf || !answersPdf)) {
-      setError('Please select both PDF files.');
+    if ((mode === 'extract' || mode === 'pdf-to-images' || mode === 'mathpix') && !questionsPdf) {
+      setError('Please select at least the questions PDF.');
       return;
     }
     if (mode === 'validate' && (!questionsPdf || !answersPdf || !excelFile)) {
@@ -261,7 +261,7 @@ const PDFUploader = () => {
     mode === 'single-pdf'
       ? !!singlePdf
       : (mode === 'extract' || mode === 'pdf-to-images' || mode === 'mathpix')
-      ? !!(questionsPdf && answersPdf)
+      ? !!questionsPdf
       : mode === 'validate'
       ? !!(questionsPdf && answersPdf && excelFile)
       // : mode === 'evaluate'
@@ -283,7 +283,7 @@ const PDFUploader = () => {
           loading={loading}
           error={error}
           success={success}
-          onPdfChange={(e) => handlePdfChange(e, 'PDF', setSinglePdf)}
+          onPdfChange={(e) => handlePdfChange(e, setSinglePdf, 'PDF')}
           onSubmit={handleSubmit}
           canSubmit={canSubmit}
         />
