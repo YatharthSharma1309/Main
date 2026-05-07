@@ -263,3 +263,184 @@ def crop_questions_from_pdf(pdf_path: str, output_dir: str) -> dict:
 
     doc.close()
     return crops
+
+
+def save_page_crops(pdf_path: str, page_index: int, layout_type: str,
+                    page_type: str, base_dir: str = ".") -> list:
+    """Render and save a page (or its left/right halves for multi-column) to disk.
+
+    Files are written to <base_dir>/questions/ or <base_dir>/solutions/.
+    Returns a list of saved absolute paths.
+    """
+    target_dir = os.path.join(base_dir, page_type)
+    os.makedirs(target_dir, exist_ok=True)
+
+    doc = fitz.open(pdf_path)
+    page = doc[page_index]
+    rect = page.rect
+    page_num = page_index + 1
+    saved = []
+
+    if layout_type == "multi_column":
+        mid_x = rect.width / 2
+        halves = [
+            ("left",  fitz.Rect(0,     0, mid_x,      rect.height)),
+            ("right", fitz.Rect(mid_x, 0, rect.width, rect.height)),
+        ]
+        for side, clip in halves:
+            pix = page.get_pixmap(matrix=_MAT, clip=clip)
+            path = os.path.join(target_dir, f"page_{page_num:03d}_{side}.png")
+            pix.save(path)
+            saved.append(os.path.abspath(path))
+    else:
+        pix = page.get_pixmap(matrix=_MAT)
+        path = os.path.join(target_dir, f"page_{page_num:03d}.png")
+        pix.save(path)
+        saved.append(os.path.abspath(path))
+
+    doc.close()
+    return saved
+
+
+def extract_figures_from_pages(pdf_path: str, page_indices: list, output_dir: str) -> list:
+    """Extract embedded images from a specific subset of pages.
+
+    Same return format as extract_figures_from_pdf — list of (page_idx, y_top, saved_path) —
+    but only processes the pages in page_indices (0-based).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    doc = fitz.open(pdf_path)
+    results = []
+    seen_xrefs = set()
+    fig_idx = 1
+
+    for page_idx in sorted(set(page_indices)):
+        if page_idx >= len(doc):
+            continue
+        page = doc[page_idx]
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+            rects = page.get_image_rects(xref)
+            y_top = rects[0].y0 if rects else 0.0
+            base_image = doc.extract_image(xref)
+            ext = base_image["ext"]
+            out_path = os.path.join(output_dir, f"figure_{fig_idx:03d}.{ext}")
+            with open(out_path, "wb") as f:
+                f.write(base_image["image"])
+            results.append((page_idx, y_top, out_path))
+            fig_idx += 1
+
+    doc.close()
+    return results
+
+
+def map_figures_to_questions_on_pages(pdf_path: str, page_indices: list, fig_data: list) -> dict:
+    """Map figure paths (from extract_figures_from_pages) to question numbers.
+
+    Scans only the specified pages for numbered question markers, then assigns
+    each figure to the nearest preceding marker by (page, y) position.
+    Returns {q_num: [list_of_figure_paths]}.  Empty dict if no markers found.
+    """
+    if not page_indices or not fig_data:
+        return {}
+
+    doc = fitz.open(pdf_path)
+    markers = []
+    expected_num = None
+
+    for page_idx in sorted(set(page_indices)):
+        if page_idx >= len(doc):
+            continue
+        page = doc[page_idx]
+        blocks = sorted(page.get_text("blocks"), key=lambda b: (b[1], b[0]))
+        for block in blocks:
+            if block[6] != 0:
+                continue
+            first_line = block[4].strip().split('\n')[0]
+            m = _Q_PATTERN.match(first_line)
+            if not m:
+                continue
+            num = int(m.group(1))
+            if expected_num is None or num == expected_num:
+                markers.append((num, page_idx, block[1]))
+                expected_num = num + 1
+
+    doc.close()
+
+    if not markers:
+        return {}
+
+    def _find_nearest(img_page: int, img_y: float):
+        result = None
+        for q_num, q_page, q_y in markers:
+            if q_page < img_page or (q_page == img_page and q_y <= img_y):
+                result = q_num
+            else:
+                break
+        return result if result is not None else markers[0][0]
+
+    q_figures: dict = {q_num: [] for q_num, _, _ in markers}
+    for img_page, img_y, path in sorted(fig_data, key=lambda x: (x[0], x[1])):
+        q_num = _find_nearest(img_page, img_y)
+        if q_num in q_figures:
+            q_figures[q_num].append(path)
+
+    return q_figures
+
+
+def detect_layout_fitz(pdf_path: str, page_index: int) -> dict:
+    """Detect single vs multi-column layout using PyMuPDF text block positions.
+
+    Skips the top 25 % of the page so full-width titles/headers don't pollute
+    the column signal.  Returns a dict with: layout, columns, confidence, reason.
+    """
+    doc = fitz.open(pdf_path)
+    page = doc[page_index]
+    page_width = page.rect.width
+    page_height = page.rect.height
+
+    # blocks: (x0, y0, x1, y1, text, block_no, block_type)  block_type 0 = text
+    blocks = page.get_text("blocks")
+    doc.close()
+
+    # Keep only text blocks in the content body (below the top-25 % header band)
+    content_blocks = [
+        b for b in blocks
+        if b[6] == 0
+        and b[1] > page_height * 0.25
+        and len(b[4].strip()) > 10
+    ]
+
+    if len(content_blocks) < 4:
+        return {
+            "layout": "single_column",
+            "columns": 1,
+            "confidence": 0.5,
+            "reason": "Too few content blocks to determine layout",
+        }
+
+    # A right-column block starts past 35 % of the page width
+    col_threshold = page_width * 0.35
+    left_blocks  = [b for b in content_blocks if b[0] <= col_threshold]
+    right_blocks = [b for b in content_blocks if b[0] >  col_threshold]
+
+    if len(right_blocks) >= 3 and len(left_blocks) >= 3:
+        return {
+            "layout": "multi_column",
+            "columns": 2,
+            "confidence": 0.92,
+            "reason": (
+                f"{len(left_blocks)} blocks in left column, "
+                f"{len(right_blocks)} blocks in right column"
+            ),
+        }
+
+    return {
+        "layout": "single_column",
+        "columns": 1,
+        "confidence": 0.92,
+        "reason": f"All {len(content_blocks)} content blocks start in the left region",
+    }

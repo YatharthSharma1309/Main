@@ -1,0 +1,115 @@
+.gpe-form {
+  background: white;
+  border-radius: 12px;
+  padding: 30px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  margin-bottom: 30px;
+}
+
+.gpe-form h2 {
+  color: #333;
+  margin-top: 0;
+  margin-bottom: 10px;
+  font-size: 24px;
+}
+
+.submit-button.gpe {
+  background: #7c3aed;
+}
+
+.submit-button.gpe:hover:not(:disabled) {
+  background: #6d28d9;
+}
+
+/* ── Results table ── */
+
+.gpe-results {
+  margin-top: 28px;
+}
+
+.gpe-results h3 {
+  color: #333;
+  margin-bottom: 12px;
+  font-size: 18px;
+}
+
+.gpe-table-wrapper {
+  overflow-x: auto;
+  border-radius: 8px;
+  border: 1px solid #e5e7eb;
+}
+
+.gpe-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.gpe-table thead tr {
+  background: #f9fafb;
+}
+
+.gpe-table th {
+  padding: 10px 14px;
+  text-align: left;
+  font-weight: 600;
+  color: #374151;
+  border-bottom: 2px solid #e5e7eb;
+  white-space: nowrap;
+}
+
+.gpe-table td {
+  padding: 9px 14px;
+  border-bottom: 1px solid #f3f4f6;
+  color: #4b5563;
+}
+
+.gpe-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.gpe-table tbody tr:hover {
+  background: #f9fafb;
+}
+
+.gpe-cell-center {
+  text-align: center;
+}
+
+.gpe-cell-reason {
+  font-size: 13px;
+  color: #6b7280;
+  max-width: 320px;
+}
+
+/* ── Type badges ── */
+
+.gpe-badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.badge-questions {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.badge-solutions {
+  background: #fff7ed;
+  color: #9a3412;
+}
+
+.badge-theory {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.badge-misc {
+  background: #f3f4f6;
+  color: #6b7280;
+}
