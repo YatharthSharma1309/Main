@@ -37,3 +37,4 @@ node_modules/
 n8n_workflow.json
 figures/
 questions/
+pipeline_output/

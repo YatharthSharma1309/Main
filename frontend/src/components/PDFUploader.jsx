@@ -20,6 +20,7 @@ const PDFUploader = () => {
   // const [agentId, setAgentId] = useState('');
   // const [deploymentSlug, setDeploymentSlug] = useState('');
   const [singlePdf, setSinglePdf] = useState(null);
+  const [singlePdfSummary, setSinglePdfSummary] = useState(null);
   const [mathpixModel, setMathpixModel] = useState('text');
   const [pdfToImagesModel, setPdfToImagesModel] = useState('haiku');
   const [loading, setLoading] = useState(false);
@@ -34,6 +35,7 @@ const PDFUploader = () => {
     setMode(newMode);
     setError(null);
     setSuccess(false);
+    setSinglePdfSummary(null);
   };
 
   // ── File handlers ──────────────────────────────────────────────────────────
@@ -107,14 +109,15 @@ const PDFUploader = () => {
   const handleSinglePdfExtract = async () => {
     const fd = new FormData();
     fd.append('pdf', singlePdf);
-    fd.append('model', 'sonnet');
+    fd.append('model', 'haiku');
 
     const res = await fetch('/api/extract-single', { method: 'POST', body: fd });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || 'Failed to extract Q&A');
     }
-    triggerDownload(await res.blob(), 'single_pdf_output.xlsx');
+    setSinglePdfSummary(res.headers.get('X-Extraction-Summary'));
+    triggerDownload(await res.blob(), 'single_pdf_output.zip');
   };
 
   const handleExtract = async () => {
@@ -172,15 +175,16 @@ const PDFUploader = () => {
   const handlePdfToImages = async () => {
     const fd = new FormData();
     fd.append('questions_pdf', questionsPdf);
-    fd.append('answers_pdf', answersPdf || questionsPdf);
-    fd.append('model', pdfToImagesModel);
+    if (answersPdf) fd.append('answers_pdf', answersPdf);
 
     const res = await fetch('/api/pdf-to-images', { method: 'POST', body: fd });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || `Server error ${res.status}`);
     }
-    triggerDownload(await res.blob(), 'questions_output.xlsx');
+    const summary = res.headers.get('X-Extraction-Summary');
+    if (summary) setSinglePdfSummary(summary);
+    triggerDownload(await res.blob(), 'question_crops.zip');
   };
 
   const handleGeneralPurposeExtraction = async () => {
@@ -306,6 +310,7 @@ const PDFUploader = () => {
           loading={loading}
           error={error}
           success={success}
+          extractionSummary={singlePdfSummary}
           onPdfChange={(e) => handlePdfChange(e, setSinglePdf, 'PDF')}
           onSubmit={handleSubmit}
           canSubmit={canSubmit}
@@ -332,7 +337,6 @@ const PDFUploader = () => {
         <PdfToImages
           questionsPdf={questionsPdf}
           answersPdf={answersPdf}
-          model={pdfToImagesModel}
           loading={loading}
           error={error}
           success={success}
@@ -341,7 +345,6 @@ const PDFUploader = () => {
             if (fileType === 'questions') handlePdfChange(e, setQuestionsPdf, label);
             else handlePdfChange(e, setAnswersPdf, label);
           }}
-          onModelChange={setPdfToImagesModel}
           onSubmit={handleSubmit}
           canSubmit={canSubmit}
         />

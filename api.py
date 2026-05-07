@@ -3,6 +3,8 @@ import json
 import base64
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
+load_dotenv()
 from difflib import SequenceMatcher
 from flask import Flask, request, send_file, jsonify
 from werkzeug.utils import secure_filename
@@ -27,10 +29,11 @@ from src.pdf_utils import (
     extract_figures_from_pdf,
     build_question_mapping, crop_questions_from_pdf,
     extract_figures_per_question,
+    extract_question_texts_from_pdf,
     pdf_pages_to_png, save_page_crops, detect_layout_fitz,
     extract_figures_from_pages, map_figures_to_questions_on_pages,
 )
-from src.vision import call_vision
+from src.vision import call_vision, _MODEL_ALIASES
 from src.mathpix import call_mathpix
 from src.page_classifier import classify_page_with_gpt
 
@@ -401,6 +404,270 @@ def extract_qa():
 #             pass
 
 
+def _render_all_pages(pdf_path: str, output_dir: str, scale: float = 2.0) -> list:
+    """Render every page of a PDF to a PNG at the given scale.
+
+    Returns [(page_idx, img_path, page_w_pts, page_h_pts, img_h_px), ...].
+    img_h_px is the rendered pixel height (= page_h_pts * scale).
+    """
+    import fitz
+    mat = fitz.Matrix(scale, scale)
+    doc = fitz.open(pdf_path)
+    pages = []
+    for page_idx, page in enumerate(doc):
+        pix  = page.get_pixmap(matrix=mat)
+        path = os.path.join(output_dir, f'_pg{page_idx:03d}.png')
+        pix.save(path)
+        pages.append((page_idx, path, page.rect.width, page.rect.height, pix.height))
+    doc.close()
+    return pages
+
+
+def _classify_pages_vision(page_records: list, model: str) -> dict:
+    """Classify each rendered page image as 'questions', 'answers', or 'other'.
+
+    page_records: list of (page_idx, img_path, ...) from _render_all_pages.
+    Returns {page_idx: classification_string}.
+    """
+    from src.claude_vision import classify_page_claude
+
+    def _classify(record):
+        page_idx, img_path = record[0], record[1]
+        try:
+            return page_idx, classify_page_claude(img_path, model)
+        except Exception:
+            return page_idx, "other"
+
+    with ThreadPoolExecutor(max_workers=_VISION_MAX_WORKERS) as executor:
+        futures = [executor.submit(_classify, r) for r in page_records]
+    return dict(f.result() for f in futures)
+
+
+def _crop_questions_vision(pdf_path: str, output_dir: str, model: str) -> tuple:
+    """Vision-based question cropping + answer extraction for scanned PDFs.
+
+    Renders ALL pages, classifies each via Claude, then:
+    - question / other pages → extract individual question positions and crop
+    - answers pages          → extract answers by question number
+
+    Returns (crops, answers_dict) where:
+        crops        = {q_num: crop_path}
+        answers_dict = {q_num: answer_text}
+    """
+    import fitz
+    from src.claude_vision import (
+        extract_questions_from_page_claude,
+        extract_answers_from_page_claude,
+    )
+
+    resolved_model = _MODEL_ALIASES.get(model, model)
+    SCALE = 2.0
+
+    page_records    = _render_all_pages(pdf_path, output_dir, scale=SCALE)
+    classifications = _classify_pages_vision(page_records, resolved_model)
+
+    mat  = fitz.Matrix(SCALE, SCALE)
+    doc  = fitz.open(pdf_path)
+    crops        = {}
+    answers_dict = {}
+
+    for page_idx, img_path, page_w, page_h, img_h_px in page_records:
+        label = classifications.get(page_idx, "other")
+
+        # Answer pages: extract answers then discard the image.
+        if label == "answers":
+            try:
+                answers_dict.update(extract_answers_from_page_claude(img_path, resolved_model))
+            except Exception:
+                pass
+            try:
+                os.remove(img_path)
+            except Exception:
+                pass
+            continue
+
+        # Question / other pages: attempt question extraction.
+        # "other" pages are retried because marks like [1][2][3] beside questions
+        # can cause the classifier to mislabel a question page as "other".
+        page = doc[page_idx]
+
+        try:
+            entries = extract_questions_from_page_claude(img_path, resolved_model)
+        except Exception:
+            entries = []
+        finally:
+            try:
+                os.remove(img_path)
+            except Exception:
+                pass
+
+        # No questions on an "other"-labelled page → silently skip.
+        if not entries and label != "questions":
+            continue
+
+        if not entries:
+            # Fallback for confirmed question pages: keep full page as one crop.
+            pix = page.get_pixmap(matrix=mat)
+            out = os.path.join(output_dir, f'question_{page_idx + 1:03d}.png')
+            pix.save(out)
+            crops[page_idx + 1] = out
+            continue
+
+        entries_sorted = sorted(entries, key=lambda e: e["y_px"])
+        PADDING_PX = 15
+        FOOTER_PX  = 60
+
+        for i, entry in enumerate(entries_sorted):
+            q_num  = entry["question_num"]
+            top_px = max(0, entry["y_px"] - PADDING_PX)
+            bot_px = (entries_sorted[i + 1]["y_px"] + PADDING_PX
+                      if i + 1 < len(entries_sorted) else img_h_px - FOOTER_PX)
+            bot_px = min(img_h_px, bot_px)
+
+            if bot_px - top_px < 20:
+                continue
+
+            y0    = top_px / SCALE
+            y1    = bot_px / SCALE
+            clip  = fitz.Rect(0, y0, page_w, y1)
+            q_pix = page.get_pixmap(matrix=mat, clip=clip)
+            out   = os.path.join(output_dir, f'question_{q_num:03d}.png')
+            q_pix.save(out)
+            crops[q_num] = out
+
+    doc.close()
+    return crops, answers_dict
+
+
+# Multi-word phrases that are unambiguous heading markers for answer/solution sections.
+_ANSWER_PAGE_KEYWORDS = {
+    "answer key", "answer sheet", "answer book",
+    "mark scheme", "marking scheme",
+    "model answer", "model solution",
+    "worked solution", "worked example",
+    "solution key", "solutions to",
+    "correct answer", "correct answers",
+    "hints and solutions", "hints & solutions",
+    "answers and solutions",
+}
+
+# Single words that, when they appear as the first non-empty line of a page
+# (i.e. as a heading), signal an answer/solution section.
+_ANSWER_HEADING_WORDS = {
+    "answers", "answer", "solutions", "solution",
+    "hints", "key",
+}
+
+_MCQ_ANSWER_TABLE_KEYWORDS = {
+    "correct answer", "correct answers", "answer key", "answer sheet",
+    "q.no", "q. no", "question no", "question number",
+}
+
+_MARKING_SCHEME_KEYWORDS = {
+    "award marks", "should award", "marking scheme", "mark scheme",
+    "teacher should", "marks awarded", "award full marks",
+}
+
+
+def _is_answer_key_page(page) -> bool:
+    """Return True when a page is an answer/solution page rather than a question page."""
+    text = page.get_text("text").lower()
+    if not text.strip():
+        return False
+
+    first_500 = text[:500]
+
+    # Multi-word phrases anywhere in the first 500 characters
+    if any(kw in first_500 for kw in _ANSWER_PAGE_KEYWORDS):
+        return True
+
+    # Single-word headings: the very first non-empty line of the page
+    first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    return first_line in _ANSWER_HEADING_WORDS
+
+
+def _is_mcq_answer_table_page(page_text_lower: str) -> bool:
+    """True when the page likely contains a simple Q-number → answer table."""
+    is_mcq    = any(kw in page_text_lower for kw in _MCQ_ANSWER_TABLE_KEYWORDS)
+    is_scheme = any(kw in page_text_lower for kw in _MARKING_SCHEME_KEYWORDS)
+    return is_mcq and not is_scheme
+
+
+def _vision_pipeline_for_scanned_pdf(pdf_path: str, questions_dir: str, model: str) -> list:
+    """Full vision-based Q&A extraction for PDFs where PyMuPDF can't read the text.
+
+    Renders ALL pages to images, classifies each page via Claude as 'questions',
+    'answers', or 'other', then:
+    - question pages  → extract all questions + y-positions
+    - answer pages    → extract full answers (single-word, multi-line, or with figures)
+    - other pages     → skip
+
+    Returns a result list in the same format as _transcribe_all_parallel.
+    """
+    from src.claude_vision import (
+        extract_questions_from_page_claude,
+        extract_answers_from_page_claude,
+    )
+
+    resolved_model = _MODEL_ALIASES.get(model, model)
+
+    # Step 1: render all pages
+    page_records    = _render_all_pages(pdf_path, questions_dir, scale=2.0)
+
+    # Step 2: classify all pages in parallel
+    classifications = _classify_pages_vision(page_records, resolved_model)
+
+    q_imgs = [r[1] for r in page_records if classifications.get(r[0]) in ("questions", "other")]
+    a_imgs = [r[1] for r in page_records if classifications.get(r[0]) == "answers"]
+    # "other" pages are attempted for question extraction too — marks like [1][2][3]
+    # beside questions can make the classifier label a question page as "other".
+
+    # Step 3a: extract answers from answer pages (sequential — usually few pages)
+    answers_dict: dict = {}
+    for img_path in a_imgs:
+        try:
+            answers_dict.update(extract_answers_from_page_claude(img_path, resolved_model))
+        except Exception:
+            pass
+        try:
+            os.remove(img_path)
+        except Exception:
+            pass
+
+    # Step 3b: extract questions from question pages (parallel)
+    def _extract_q(img_path: str) -> list:
+        try:
+            return extract_questions_from_page_claude(img_path, resolved_model)
+        except Exception:
+            return []
+        finally:
+            try:
+                os.remove(img_path)
+            except Exception:
+                pass
+
+    with ThreadPoolExecutor(max_workers=_VISION_MAX_WORKERS) as executor:
+        futures = [executor.submit(_extract_q, p) for p in q_imgs]
+    all_questions = []
+    for f in futures:
+        all_questions.extend(f.result())
+
+    all_questions.sort(key=lambda q: q["question_num"])
+
+    result = []
+    for q in all_questions:
+        q_num  = q["question_num"]
+        answer = answers_dict.get(q_num, "N/A")
+        result.append({
+            "question_num":  str(q_num),
+            "question_text": sanitize(latex_to_unicode(q["question_text"])),
+            "answers":       sanitize(latex_to_unicode(str(answer))),
+            "figures":       "",
+            "source":        "vision (no extractable text)",
+        })
+    return result
+
+
 def _prepare_work_dirs(base_dir: str) -> tuple:
     questions_dir = os.path.join(base_dir, 'questions')
     figures_dir   = os.path.join(base_dir, 'figures')
@@ -417,27 +684,70 @@ def _run_pdf_pipeline(questions_path: str, answers_path: str,
     return crop_by_qnum, mapping
 
 
-def _transcribe_entry(entry: dict, crop_by_qnum: dict, model: str) -> dict:
-    crop_path = crop_by_qnum.get(entry["question_num"])
-    figs = entry.get("figure") or []
+def _extraction_summary(result: list) -> str:
+    """Return a compact header value describing how questions were extracted."""
+    pdf_count    = sum(1 for r in result if r.get("source") == "pymupdf")
+    vision_count = sum(1 for r in result if r.get("source", "").startswith("vision"))
+    reasons      = list({r["source"] for r in result if r.get("source", "").startswith("vision")})
+    reason_str   = "; ".join(reasons) if reasons else ""
+    return f"pdf:{pdf_count},vision:{vision_count},reasons:{reason_str}"
+
+
+def _is_useful_text(text: str) -> bool:
+    """True when the string has enough readable content to skip vision."""
+    if not text or len(text.strip()) < 15:
+        return False
+    printable = sum(1 for c in text if c.isprintable() and not c.isspace())
+    return printable / len(text) > 0.6
+
+
+def _transcribe_entry(entry: dict, crop_by_qnum: dict, model: str,
+                      pdf_texts: dict = None) -> dict:
+    q_num = entry["question_num"]
+    figs  = entry.get("figure") or []
+
+    # Try PyMuPDF embedded text first
+    if pdf_texts:
+        raw = pdf_texts.get(q_num, "")
+        if _is_useful_text(raw):
+            return {
+                "question_num":  str(q_num),
+                "question_text": sanitize(latex_to_unicode(raw)),
+                "answers":       sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
+                "figures":       ", ".join(os.path.basename(p) for p in figs),
+                "source":        "pymupdf",
+            }
+
+    # Fall back to Claude Haiku vision
+    crop_path = crop_by_qnum.get(q_num)
+    reason = "no embedded text" if not (pdf_texts and pdf_texts.get(q_num)) else "text too short/garbled"
     if crop_path and os.path.exists(crop_path):
         try:
             q_text = call_vision(crop_path, figure_count=len(figs), model=model)
+            source = f"vision ({reason})"
         except Exception as exc:
             q_text = f"[vision error: {exc}]"
+            source = f"vision error ({reason})"
     else:
         q_text = ""
+        source = f"missing crop ({reason})"
+
     return {
-        "question_num":  str(entry["question_num"]),
+        "question_num":  str(q_num),
         "question_text": sanitize(latex_to_unicode(q_text)),
         "answers":       sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
         "figures":       ", ".join(os.path.basename(p) for p in figs),
+        "source":        source,
     }
 
 
-def _transcribe_all_parallel(mapping: list, crop_by_qnum: dict, model: str) -> list:
+def _transcribe_all_parallel(mapping: list, crop_by_qnum: dict, model: str,
+                              pdf_texts: dict = None) -> list:
     with ThreadPoolExecutor(max_workers=_VISION_MAX_WORKERS) as executor:
-        futures = [executor.submit(_transcribe_entry, entry, crop_by_qnum, model) for entry in mapping]
+        futures = [
+            executor.submit(_transcribe_entry, entry, crop_by_qnum, model, pdf_texts)
+            for entry in mapping
+        ]
     return [f.result() for f in futures]
 
 
@@ -446,7 +756,7 @@ def _write_questions_excel(result: list, output_path: str) -> None:
     ws = wb.active
     ws.title = "Questions"
 
-    ws.append(["question_num", "question_text", "figures", "answers"])
+    ws.append(["question_num", "question_text", "figures", "answers", "source"])
     header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
     for cell in ws[1]:
@@ -454,59 +764,114 @@ def _write_questions_excel(result: list, output_path: str) -> None:
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
+    vision_fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
     for entry in result:
-        ws.append([entry["question_num"], entry["question_text"], entry["figures"], entry["answers"]])
+        source = entry.get("source", "")
+        ws.append([entry["question_num"], entry["question_text"],
+                   entry["figures"], entry["answers"], source])
         row = ws.max_row
         ws.cell(row, 1).alignment = Alignment(horizontal="center", vertical="top")
         ws.cell(row, 2).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
         ws.cell(row, 3).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
         ws.cell(row, 4).alignment = Alignment(horizontal="center", vertical="center")
+        ws.cell(row, 5).alignment = Alignment(horizontal="left",   vertical="center")
+        if source.startswith("vision"):
+            for col in range(1, 6):
+                ws.cell(row, col).fill = vision_fill
 
     ws.column_dimensions['A'].width = 14
     ws.column_dimensions['B'].width = 70
     ws.column_dimensions['C'].width = 35
     ws.column_dimensions['D'].width = 18
+    ws.column_dimensions['E'].width = 28
     wb.save(output_path)
 
 
 @app.route('/api/pdf-to-images', methods=['POST'])
 def pdf_to_images():
+    import zipfile
     questions_path = None
-    answers_path = None
+    answers_path   = None
+    excel_path     = None
     try:
-        is_valid, error_msg = validate_request()
-        if not is_valid:
-            return jsonify({"error": error_msg}), 400
-
-        model          = request.form.get("model", "qwen2.5vl:7b")
-        questions_file = request.files['questions_pdf']
-        answers_file   = request.files['answers_pdf']
+        questions_file = request.files.get('questions_pdf')
+        if not questions_file or questions_file.filename == '':
+            return jsonify({"error": "Missing questions PDF"}), 400
 
         questions_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(questions_file.filename))
-        answers_path   = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(answers_file.filename))
         questions_file.save(questions_path)
-        answers_file.save(answers_path)
 
-        questions_dir, figures_dir = _prepare_work_dirs(os.getcwd())
-        crop_by_qnum, mapping = _run_pdf_pipeline(
-            questions_path, answers_path, questions_dir, figures_dir,
-        )
-        result = _transcribe_all_parallel(mapping, crop_by_qnum, model)
+        answers_file = request.files.get('answers_pdf')
+        if answers_file and answers_file.filename:
+            answers_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(answers_file.filename))
+            answers_file.save(answers_path)
 
-        output_excel = os.path.join(app.config['UPLOAD_FOLDER'], 'questions_output.xlsx')
-        _write_questions_excel(result, output_excel)
+        model = request.form.get("model", "haiku")
+        questions_dir, _ = _prepare_work_dirs(os.getcwd())
 
-        return send_file(
-            output_excel,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        # Detect and crop questions — text-based first, vision fallback for scanned PDFs
+        pdf_texts = extract_question_texts_from_pdf(questions_path)
+        answers_dict_vision: dict = {}
+        if pdf_texts:
+            crop_by_qnum = crop_questions_from_pdf(questions_path, questions_dir)
+        else:
+            crop_by_qnum, answers_dict_vision = _crop_questions_vision(questions_path, questions_dir, model)
+            pdf_texts = {}
+
+        # Extract answers from answers PDF if provided
+        answers_list = []
+        if answers_path:
+            try:
+                processor = PDFProcessor(questions_path, answers_path)
+                answers_list = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
+            except Exception:
+                answers_list = []
+
+        # Build mapping for the transcription pipeline.
+        # Priority: explicit answers PDF → vision-extracted answers → N/A
+        mapping = [
+            {
+                "question_num": q_num,
+                "figure": None,
+                "answer": (
+                    answers_list[q_num - 1]
+                    if answers_list and 0 < q_num <= len(answers_list)
+                    else sanitize(latex_to_unicode(str(answers_dict_vision.get(q_num, "N/A"))))
+                ),
+            }
+            for q_num in sorted(crop_by_qnum.keys())
+        ]
+
+        # Transcribe: uses embedded PDF text when available (zero extra tokens);
+        # falls back to Claude vision only for scanned/unreadable questions.
+        result = _transcribe_all_parallel(mapping, crop_by_qnum, model, pdf_texts)
+
+        # Write full Excel (same format as extract-single)
+        excel_path = os.path.join(app.config['UPLOAD_FOLDER'], 'extraction_results.xlsx')
+        _write_questions_excel(result, excel_path)
+
+        # Bundle: all question images + Excel into one ZIP
+        zip_path = os.path.join(app.config['UPLOAD_FOLDER'], 'question_crops.zip')
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for q_num in sorted(crop_by_qnum.keys()):
+                path = crop_by_qnum[q_num]
+                if os.path.exists(path):
+                    zf.write(path, os.path.basename(path))
+            zf.write(excel_path, 'extraction_results.xlsx')
+
+        response = send_file(
+            zip_path,
+            mimetype='application/zip',
             as_attachment=True,
-            download_name='questions_output.xlsx',
+            download_name='question_crops.zip',
         )
+        response.headers['X-Extraction-Summary'] = _extraction_summary(result)
+        return response
 
     except Exception as e:
         return jsonify({"error": f"Processing error: {str(e)}"}), 500
     finally:
-        for path in (questions_path, answers_path):
+        for path in (questions_path, answers_path, excel_path):
             try:
                 if path and os.path.exists(path):
                     os.remove(path)
@@ -516,7 +881,10 @@ def pdf_to_images():
 
 @app.route('/api/extract-single', methods=['POST'])
 def extract_single():
-    pdf_path = None
+    import zipfile
+    pdf_path    = None
+    excel_path  = None
+    zip_path    = None
     try:
         if 'pdf' not in request.files or request.files['pdf'].filename == '':
             return jsonify({"error": "Missing required file: 'pdf'"}), 400
@@ -524,31 +892,48 @@ def extract_single():
         if not allowed_file(pdf_file.filename):
             return jsonify({"error": "Only PDF files are allowed"}), 400
 
-        model = request.form.get("model", "sonnet")
+        model = request.form.get("model", "haiku")
         pdf_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(pdf_file.filename))
         pdf_file.save(pdf_path)
 
         questions_dir, figures_dir = _prepare_work_dirs(os.getcwd())
         crop_by_qnum, mapping = _run_pdf_pipeline(pdf_path, pdf_path, questions_dir, figures_dir)
-        result = _transcribe_all_parallel(mapping, crop_by_qnum, model)
 
-        output_excel = os.path.join(app.config['UPLOAD_FOLDER'], 'single_pdf_output.xlsx')
-        _write_questions_excel(result, output_excel)
+        if not mapping:
+            result = _vision_pipeline_for_scanned_pdf(pdf_path, questions_dir, model)
+        else:
+            pdf_texts = extract_question_texts_from_pdf(pdf_path)
+            result = _transcribe_all_parallel(mapping, crop_by_qnum, model, pdf_texts)
 
-        return send_file(
-            output_excel,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        excel_path = os.path.join(app.config['UPLOAD_FOLDER'], 'single_pdf_output.xlsx')
+        _write_questions_excel(result, excel_path)
+
+        # Bundle Excel + all cropped question images into one ZIP
+        zip_path = os.path.join(app.config['UPLOAD_FOLDER'], 'single_pdf_output.zip')
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.write(excel_path, 'extraction_results.xlsx')
+            for q_num in sorted(crop_by_qnum.keys()):
+                crop_path = crop_by_qnum[q_num]
+                if os.path.exists(crop_path):
+                    zf.write(crop_path, os.path.basename(crop_path))
+
+        response = send_file(
+            zip_path,
+            mimetype='application/zip',
             as_attachment=True,
-            download_name='single_pdf_output.xlsx',
+            download_name='single_pdf_output.zip',
         )
+        response.headers['X-Extraction-Summary'] = _extraction_summary(result)
+        return response
     except Exception as e:
         return jsonify({"error": f"Processing error: {str(e)}"}), 500
     finally:
-        try:
-            if pdf_path and os.path.exists(pdf_path):
-                os.remove(pdf_path)
-        except Exception:
-            pass
+        for path in (pdf_path, excel_path):
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
 
 
 def _transcribe_entry_mathpix(entry: dict, crop_by_qnum: dict, model: str) -> dict:

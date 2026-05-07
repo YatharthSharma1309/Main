@@ -3,7 +3,85 @@ import re
 import fitz  # PyMuPDF
 from src.pdf_processor import PDFProcessor
 
-_Q_PATTERN = re.compile(r'^\s*(?:Q\.?\s*)?(\d+)[.)]\s', re.IGNORECASE)
+# Fallback pattern covering the most common formats.
+_Q_PATTERN = re.compile(
+    r'^\s*Question\s+(\d+)'
+    r'|^\s*Q\s*[:.]\s*(\d+)'
+    r'|^\s*(?:Q\.?\s*)?(\d+)[.)]\s',
+    re.IGNORECASE,
+)
+
+# Ordered from most-specific to least-specific so the scorer picks the
+# tightest pattern that still gives a consecutive run of question numbers.
+_CANDIDATE_PATTERNS = [
+    re.compile(r'^\s*Question\s+(\d+)', re.IGNORECASE),       # Question 1
+    re.compile(r'^\s*Q\s*[:.]\s*(\d+)', re.IGNORECASE),       # Q: 1  Q. 1
+    re.compile(r'^\s*Q\.?\s*(\d+)\s*[.):\s]', re.IGNORECASE), # Q1. Q1) Q1:
+    re.compile(r'^\s*Q(\d+)\b', re.IGNORECASE),                # Q1  Q2
+    re.compile(r'^\s*\((\d+)\)\s*'),                           # (1) (2)
+    re.compile(r'^\s*\[(\d+)\]\s*'),                           # [1] [2]
+    re.compile(r'^\s*(\d+)\.\s'),                              # 1.  2.
+    re.compile(r'^\s*(\d+)\)\s'),                              # 1)  2)
+    re.compile(r'^\s*(\d+)\s'),                                # 1   2  (broad)
+]
+
+
+def _q_num(m) -> int:
+    """Return the captured question number from a match object (any group count)."""
+    return int(next(g for g in m.groups() if g is not None))
+
+
+def _detect_q_pattern(doc) -> re.Pattern:
+    """Scan the first few pages of an open fitz.Document and return the compiled
+    regex that best matches the PDF's question-numbering format.
+
+    Strategy: each candidate is tested against every text-block first-line in the
+    first 6 pages.  The pattern that produces the longest consecutive run of
+    question numbers starting from 1 (or 2) wins.  Falls back to _Q_PATTERN when
+    no candidate beats a minimum run of 2.
+    """
+    first_lines = []
+    for page_idx in range(min(6, len(doc))):
+        page = doc[page_idx]
+        blocks = sorted(page.get_text("blocks"), key=lambda b: (b[1], b[0]))
+        for block in blocks:
+            if block[6] != 0:
+                continue
+            line = block[4].strip().split('\n')[0]
+            if line:
+                first_lines.append(line)
+
+    best_pattern = _Q_PATTERN
+    best_score = 1  # must beat the fallback threshold
+
+    for pat in _CANDIDATE_PATTERNS:
+        nums = set()
+        for line in first_lines:
+            m = pat.match(line)
+            if m:
+                try:
+                    nums.add(int(m.group(1)))
+                except (IndexError, ValueError):
+                    pass
+
+        if not nums:
+            continue
+
+        # Longest consecutive run starting at 1 or 2
+        run = 0
+        for start in (1, 2):
+            r, expected = 0, start
+            for n in sorted(nums):
+                if n == expected:
+                    r += 1
+                    expected += 1
+            run = max(run, r)
+
+        if run > best_score:
+            best_score = run
+            best_pattern = pat
+
+    return best_pattern
 _DPI = 150
 _MAT = fitz.Matrix(_DPI / 72, _DPI / 72)
 
@@ -61,6 +139,7 @@ def build_question_mapping(questions_path: str, answers_path: str, fig_data: lis
     answers_list = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
 
     doc = fitz.open(questions_path)
+    pattern = _detect_q_pattern(doc)
     markers = []          # [(q_num, page_idx, y_top), ...] in reading order
     expected_num = None
     for page_idx, page in enumerate(doc):
@@ -69,10 +148,10 @@ def build_question_mapping(questions_path: str, answers_path: str, fig_data: lis
             if block[6] != 0:
                 continue
             first_line = block[4].strip().split('\n')[0]
-            m = _Q_PATTERN.match(first_line)
+            m = pattern.match(first_line)
             if not m:
                 continue
-            num = int(m.group(1))
+            num = _q_num(m)
             if expected_num is None or num == expected_num:
                 markers.append((num, page_idx, block[1]))
                 expected_num = num + 1
@@ -103,7 +182,7 @@ def build_question_mapping(questions_path: str, answers_path: str, fig_data: lis
         mapping.append({
             "question_num": q_num,
             "figure":       figs if figs else None,
-            "answer":       answers_list[i] if i < len(answers_list) else "N/A",
+            "answer":       answers_list[q_num - 1] if q_num - 1 < len(answers_list) else "N/A",
         })
     return mapping
 
@@ -115,6 +194,7 @@ def extract_figures_per_question(pdf_path: str, output_base_dir: str) -> dict:
     Returns {q_num: [list of saved figure paths]}.
     """
     doc = fitz.open(pdf_path)
+    pattern = _detect_q_pattern(doc)
     markers = []
     expected_num = None
 
@@ -124,10 +204,10 @@ def extract_figures_per_question(pdf_path: str, output_base_dir: str) -> dict:
             if block[6] != 0:
                 continue
             first_line = block[4].strip().split('\n')[0]
-            m = _Q_PATTERN.match(first_line)
+            m = pattern.match(first_line)
             if not m:
                 continue
-            num = int(m.group(1))
+            num = _q_num(m)
             if expected_num is None or num == expected_num:
                 markers.append((num, page_idx, block[1]))
                 expected_num = num + 1
@@ -184,6 +264,62 @@ def extract_figures_per_question(pdf_path: str, output_base_dir: str) -> dict:
     return q_figures
 
 
+def extract_question_texts_from_pdf(pdf_path: str) -> dict:
+    """Extract question text directly from PDF using PyMuPDF text blocks.
+
+    Returns {q_num: text}.  Returns an empty dict when the PDF is scanned
+    (no embedded text), so callers can fall back to a vision model.
+    """
+    doc = fitz.open(pdf_path)
+    pattern = _detect_q_pattern(doc)
+    markers = []
+    expected_num = None
+
+    for page_idx, page in enumerate(doc):
+        blocks = sorted(page.get_text("blocks"), key=lambda b: (b[1], b[0]))
+        for block in blocks:
+            if block[6] != 0:
+                continue
+            first_line = block[4].strip().split('\n')[0]
+            m = pattern.match(first_line)
+            if not m:
+                continue
+            num = _q_num(m)
+            if expected_num is None or num == expected_num:
+                markers.append((num, page_idx, block[1]))
+                expected_num = num + 1
+
+    if not markers:
+        doc.close()
+        return {}
+
+    texts = {}
+    for q_idx, (q_num, page_idx, y_top) in enumerate(markers):
+        page = doc[page_idx]
+        page_rect = page.rect
+
+        if q_idx + 1 < len(markers):
+            next_q_num, next_page_idx, next_y = markers[q_idx + 1]
+            y_limit = next_y if next_page_idx == page_idx else page_rect.height
+        else:
+            y_limit = page_rect.height
+
+        y0 = max(0.0, y_top - 2)
+        raw_bottom = _content_bottom(page, y_top, y_limit)
+        y1 = min(page_rect.height, raw_bottom + 2)
+
+        if y1 - y0 < 1:
+            continue
+
+        clip = fitz.Rect(0.0, y0, page_rect.width, y1)
+        text = page.get_text("text", clip=clip).strip()
+        if text:
+            texts[q_num] = text
+
+    doc.close()
+    return texts
+
+
 def _content_bottom(page, y_start: float, y_limit: float) -> float:
     """Return the y-bottom of the last content block (text or image) whose top
     falls in [y_start, y_limit).  Returns y_start when no blocks are found."""
@@ -192,6 +328,14 @@ def _content_bottom(page, y_start: float, y_limit: float) -> float:
         if block[1] < y_start or block[1] >= y_limit:
             continue
         bottom = max(bottom, block[3])
+    # Also include embedded XObject images (e.g. image-based answer options)
+    # that may not appear as blocks in the text extraction pipeline.
+    for img_info in page.get_images(full=True):
+        xref = img_info[0]
+        for rect in page.get_image_rects(xref):
+            if rect.y0 < y_start or rect.y0 >= y_limit:
+                continue
+            bottom = max(bottom, rect.y1)
     return bottom
 
 
@@ -203,6 +347,7 @@ def crop_questions_from_pdf(pdf_path: str, output_dir: str) -> dict:
     Falls back to {page_num: path} per page when no markers are found.
     """
     doc = fitz.open(pdf_path)
+    pattern = _detect_q_pattern(doc)
     markers = []   # [(q_num, page_idx, y_top), ...]
     expected_num = None
 
@@ -212,10 +357,10 @@ def crop_questions_from_pdf(pdf_path: str, output_dir: str) -> dict:
             if block[6] != 0:
                 continue
             first_line = block[4].strip().split('\n')[0]
-            m = _Q_PATTERN.match(first_line)
+            m = pattern.match(first_line)
             if not m:
                 continue
-            num = int(m.group(1))
+            num = _q_num(m)
             if expected_num is None or num == expected_num:
                 markers.append((num, page_idx, block[1]))
                 expected_num = num + 1
@@ -348,6 +493,7 @@ def map_figures_to_questions_on_pages(pdf_path: str, page_indices: list, fig_dat
         return {}
 
     doc = fitz.open(pdf_path)
+    pattern = _detect_q_pattern(doc)
     markers = []
     expected_num = None
 
@@ -360,10 +506,10 @@ def map_figures_to_questions_on_pages(pdf_path: str, page_indices: list, fig_dat
             if block[6] != 0:
                 continue
             first_line = block[4].strip().split('\n')[0]
-            m = _Q_PATTERN.match(first_line)
+            m = pattern.match(first_line)
             if not m:
                 continue
-            num = int(m.group(1))
+            num = _q_num(m)
             if expected_num is None or num == expected_num:
                 markers.append((num, page_idx, block[1]))
                 expected_num = num + 1

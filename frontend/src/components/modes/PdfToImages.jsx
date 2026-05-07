@@ -2,24 +2,13 @@ import React, { useRef } from 'react';
 import '../common/FileInputGroup.css';
 import './PdfToImages.css';
 
-const MODEL_OPTIONS = [
-  { value: 'haiku',     label: 'Claude Haiku (default)' },
-  { value: 'sonnet',    label: 'Claude Sonnet (more accurate)' },
-  { value: 'gpt-4o',   label: 'GPT-4o' },
-  { value: 'gpt-4o-mini', label: 'GPT-4o Mini' },
-  { value: 'qwen2.5vl:7b', label: 'Ollama (local)' },
-];
-
 const PdfToImages = ({
   questionsPdf,
   answersPdf,
-  model,
   loading,
   error,
   success,
-  result,
   onPdfChange,
-  onModelChange,
   onSubmit,
   canSubmit,
 }) => {
@@ -28,10 +17,11 @@ const PdfToImages = ({
 
   return (
     <div className="pdf-to-images-form">
-      <h2>Convert PDF to Images</h2>
+      <h2>PDF to Images + Excel</h2>
       <p className="form-description">
-        Renders every page as a PNG (saved to <code>pages/</code>) and crops
-        each detected question into its own PNG (saved to <code>questions/</code>).
+        Crops each question into its own PNG and runs full Q&amp;A extraction. Downloads a ZIP
+        containing all question images and <code>extraction_results.xlsx</code> with question
+        text and answers. Provide the Answers PDF to populate the answer column.
       </p>
 
       <div className="file-input-group">
@@ -53,7 +43,10 @@ const PdfToImages = ({
       </div>
 
       <div className="file-input-group">
-        <label htmlFor="a-pdf">Answers PDF <span style={{fontWeight:'normal',color:'#888'}}>(optional — uses questions PDF if omitted)</span></label>
+        <label htmlFor="a-pdf">
+          Answers PDF{' '}
+          <span style={{ fontWeight: 'normal', color: '#888' }}>(optional)</span>
+        </label>
         <input
           ref={answersInputRef}
           id="a-pdf"
@@ -70,26 +63,12 @@ const PdfToImages = ({
         )}
       </div>
 
-      <div className="file-input-group">
-        <label htmlFor="pti-model">Vision Model</label>
-        <select
-          id="pti-model"
-          value={model}
-          onChange={(e) => onModelChange(e.target.value)}
-          disabled={loading}
-          className="model-select"
-        >
-          {MODEL_OPTIONS.map((opt) => (
-            <option key={opt.value} value={opt.value}>{opt.label}</option>
-          ))}
-        </select>
-      </div>
-
       {error && <div className="error-message">{error}</div>}
 
       {success && (
         <div className="success-message">
-          <strong>Done!</strong> Your Excel file has been downloaded.
+          <strong>Done!</strong> ZIP downloaded — contains cropped question images and{' '}
+          <code>extraction_results.xlsx</code> with question text and answers.
         </div>
       )}
 
@@ -99,7 +78,7 @@ const PdfToImages = ({
         onClick={onSubmit}
         className="submit-button"
       >
-        {loading ? 'Processing...' : 'Convert to Images'}
+        {loading ? 'Processing...' : 'Extract & Download ZIP'}
       </button>
     </div>
   );

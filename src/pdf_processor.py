@@ -115,38 +115,49 @@ class PDFProcessor:
     def parse_answers(self, text: str) -> List[str]:
         """
         Parse answers from extracted text.
-        Supports JEE Main answer key format: {n}. (k) or {n}. number
-        Examples:
-            1. (2)    → MCQ option 2
-            2. 12     → numerical answer 12
-            134. 2.18 → decimal answer 2.18
-        Falls back to 'Answer: X' or single-letter A/B/C/D formats.
 
-        Args:
-            text: Raw text extracted from PDF
+        Tries formats in order:
+        1. Table: "Q.No  Correct Answers" table with plain numbers  → "1  3"
+        2. Alternating-line table: Q number on one line, answer on next
+        3. JEE Main: "1. (2)"  or  "1. 12"
+        4. "Answer: X"
+        5. Bare A/B/C/D lines
 
-        Returns:
-            List of answers indexed by question number (index 0 = Q1's answer)
+        Returns list indexed by question number (index 0 = Q1's answer).
         """
-        # JEE Main answer key: number. followed by (k) or a plain/decimal number
-        jee_pattern = r'\b(\d+)\.\s+(\(\d+\)|\d+(?:\.\d+)?)'
-        matches = re.findall(jee_pattern, text)
+        # ── 1. Same-line table: "1  3"  "2  2" (2+ spaces or tab between Q and answer)
+        table_line = re.findall(r'^(\d+)[ \t]{2,}(\d+)\s*$', text, re.MULTILINE)
+        if table_line:
+            answer_dict = {int(q): ans for q, ans in table_line}
+            max_num = max(answer_dict.keys())
+            return [answer_dict.get(i, "N/A") for i in range(1, max_num + 1)]
 
-        if matches:
-            answer_dict = {}
-            for num_str, answer in matches:
-                answer_dict[int(num_str)] = answer
-            if answer_dict:
+        # ── 2. Alternating-line table after "Correct Answers" or "Answer Key" header
+        header_match = re.search(r'(?:Correct Answers?|Answer Key)', text, re.IGNORECASE)
+        if header_match:
+            after = text[header_match.end():]
+            # Grab lines that are purely a single integer
+            num_lines = re.findall(r'^\s*(\d+)\s*$', after, re.MULTILINE)
+            # Expect even count: Q, A, Q, A ...
+            if len(num_lines) >= 2 and len(num_lines) % 2 == 0:
+                answer_dict = {int(num_lines[i]): num_lines[i + 1]
+                               for i in range(0, len(num_lines), 2)}
                 max_num = max(answer_dict.keys())
                 return [answer_dict.get(i, "N/A") for i in range(1, max_num + 1)]
 
-        # Standard "Answer: X" format
-        answer_pattern = r'Answer:\s*([A-D])'
-        matches = re.findall(answer_pattern, text, re.IGNORECASE)
-        if matches:
-            return matches
+        # ── 3. JEE Main: "1. (2)"  or  "1. 12"  or  "1. 2.18"
+        jee = re.findall(r'\b(\d+)\.\s+(\(\d+\)|\d+(?:\.\d+)?)', text)
+        if jee:
+            answer_dict = {int(q): ans for q, ans in jee}
+            max_num = max(answer_dict.keys())
+            return [answer_dict.get(i, "N/A") for i in range(1, max_num + 1)]
 
-        # Single letter answers
+        # ── 4. "Answer: X"
+        letter_answers = re.findall(r'Answer:\s*([A-D])', text, re.IGNORECASE)
+        if letter_answers:
+            return letter_answers
+
+        # ── 5. Bare A/B/C/D lines
         lines = text.split('\n')
         return [line.strip() for line in lines if line.strip() in ['A', 'B', 'C', 'D']]
 

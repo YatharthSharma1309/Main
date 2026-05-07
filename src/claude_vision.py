@@ -1,7 +1,218 @@
+import re
 import base64
 import anthropic
 
 from src.vision import _VISION_PROMPT_TEMPLATE, _FIGURE_RULE_PRESENT, _FIGURE_RULE_ABSENT
+
+
+# Built at call time with actual image height
+_PAGE_EXTRACT_PROMPT_TEMPLATE = """\
+You are an expert exam question extractor.
+
+This image shows a page from an exam paper (image height: {image_height} pixels, \
+top = 0, bottom = {image_height}).
+
+Questions may be numbered in any format — for example:
+  "Q: 1", "Q.1", "Q1.", "1.", "1)", "(1)", "Question 1", or plain "1".
+
+CRITICAL RULE: Use the EXACT question number printed on the page. \
+Do NOT renumber questions starting from 1. \
+For example, if this page shows Q: 8, Q: 9, Q: 10, output QUESTION 8, QUESTION 9, QUESTION 10.
+
+For each question on this page:
+1. Read the question number exactly as printed (e.g. if you see "Q: 11", use 11).
+2. Give the y-pixel coordinate of the TOP of that question's label, measured from \
+the very top of the image.
+3. Extract the COMPLETE question text including all sub-parts, answer options \
+(A/B/C/D or 1/2/3/4), marks in brackets, and any instructions.
+4. Write math in plain Unicode — fractions as (a)/(b), exponents as ^N, \
+square roots as sqrt(x). No LaTeX, no backslashes.
+5. If a figure, diagram, graph, or image appears anywhere inside the question or \
+its options, write [Figure] at that exact position.
+
+Output ONLY in this exact format — one block per question, nothing else:
+
+QUESTION 8 (y=95):
+[complete text of question 8]
+
+QUESTION 9 (y=580):
+[complete text of question 9]
+
+Use the EXACT question number from the page and the actual pixel y-coordinate.\
+"""
+
+_PAGE_CLASSIFY_PROMPT = """\
+You are classifying a single page from an exam document.
+
+A page may have a logo, header, or branding at the top — ignore those and focus \
+on the main body content.
+
+Classify the page as exactly one of:
+- "questions" — the main body contains numbered exam questions for students to answer \
+  (even if there is a logo, subject heading, or marks in brackets alongside the questions)
+- "answers"   — the main body contains an answer key, correct answers table, solutions, \
+  model answers, worked examples, or a marking scheme
+- "other"     — the page is purely a cover, title page, blank page, syllabus, \
+  table of contents, or instructions with no actual questions or answers
+
+When in doubt between "questions" and "other", choose "questions" if you can see \
+any numbered items that look like exam questions.
+
+Output ONLY the single word: questions, answers, or other\
+"""
+
+_PAGE_ANSWER_PROMPT = """\
+This page contains answers or solutions to exam questions.
+
+For each question that has an answer on this page:
+1. Identify the question number.
+2. Extract the COMPLETE answer — this may be a single letter or number, a word, \
+a full sentence, multiple lines of working, or a combination of text and figures. \
+Include all steps, explanations, and sub-parts.
+3. If the answer includes a diagram, graph, image, or drawn figure, \
+write [Figure] at that position in the text.
+4. Write math in plain Unicode — fractions as (a)/(b), exponents as ^N, \
+square roots as sqrt(x). No LaTeX, no backslashes.
+5. Do NOT include mark allocations (e.g. "(2 marks)", "[1]") as part of the answer text.
+
+Output ONLY in this exact format — one block per answer, nothing else:
+
+ANSWER 1:
+[complete answer for question 1]
+
+ANSWER 2:
+[complete answer for question 2]
+
+Use the actual question number from the page.\
+"""
+
+
+def classify_page_claude(image_path: str,
+                         model: str = "claude-haiku-4-5-20251001") -> str:
+    """Classify a page image as 'questions', 'answers', or 'other'.
+
+    Returns exactly one of those three strings.
+    """
+    with open(image_path, "rb") as f:
+        image_b64 = base64.standard_b64encode(f.read()).decode("utf-8")
+
+    client = anthropic.Anthropic()
+    message = client.messages.create(
+        model=model,
+        max_tokens=16,
+        temperature=0,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
+                {"type": "text", "text": _PAGE_CLASSIFY_PROMPT},
+            ],
+        }],
+    )
+    raw = message.content[0].text.strip().lower()
+    if "answer" in raw or "solution" in raw:
+        return "answers"
+    if "question" in raw:
+        return "questions"
+    return "other"
+
+
+def extract_questions_from_page_claude(image_path: str,
+                                       model: str = "claude-haiku-4-5-20251001") -> list:
+    """Extract all questions from a full-page exam image using Claude vision.
+
+    Returns list of {"question_num": int, "question_text": str, "y_px": int}.
+    y_px is the pixel y-coordinate of the question label from the top of the image.
+    """
+    from PIL import Image as _PILImage
+    with _PILImage.open(image_path) as _img:
+        _img_h = _img.size[1]
+
+    with open(image_path, "rb") as f:
+        image_b64 = base64.standard_b64encode(f.read()).decode("utf-8")
+
+    prompt = _PAGE_EXTRACT_PROMPT_TEMPLATE.format(image_height=_img_h)
+
+    client = anthropic.Anthropic()
+    message = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        temperature=0,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+    )
+    raw = message.content[0].text.strip()
+
+    entries = []
+    pattern = re.compile(
+        r'QUESTION\s+(\d+)\s*\(y\s*=\s*(\d+)\s*\)\s*:\s*\n(.*?)(?=\nQUESTION\s+\d+\s*\(y\s*=|$)',
+        re.DOTALL,
+    )
+    for m in pattern.finditer(raw):
+        entries.append({
+            "question_num":  int(m.group(1)),
+            "y_px":          int(m.group(2)),
+            "question_text": m.group(3).strip(),
+        })
+
+    # Validate: y_px should increase with question_num.
+    # If not monotonically increasing, re-sort by y_px and reassign to match
+    # the expected question numbers from the text content.
+    if len(entries) >= 2:
+        by_y = sorted(entries, key=lambda e: e["y_px"])
+        by_q = sorted(entries, key=lambda e: e["question_num"])
+        if any(by_y[i]["question_num"] != by_q[i]["question_num"] for i in range(len(by_y))):
+            for entry, positioned in zip(by_q, by_y):
+                entry["y_px"] = positioned["y_px"]
+
+    return entries
+
+
+def extract_answers_from_page_claude(image_path: str,
+                                     model: str = "claude-haiku-4-5-20251001") -> dict:
+    """Extract answers from an answer/solution page image using Claude vision.
+
+    Handles all answer formats: single letter/number, full sentences, multi-line
+    worked solutions, and answers that include figures.
+
+    Returns {q_num: answer_text} where answer_text may be multi-line.
+    """
+    with open(image_path, "rb") as f:
+        image_b64 = base64.standard_b64encode(f.read()).decode("utf-8")
+
+    client = anthropic.Anthropic()
+    message = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        temperature=0,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
+                {"type": "text", "text": _PAGE_ANSWER_PROMPT},
+            ],
+        }],
+    )
+    raw = message.content[0].text.strip()
+
+    result = {}
+    pattern = re.compile(
+        r'ANSWER\s+(\d+)\s*:\s*\n(.*?)(?=\nANSWER\s+\d+\s*:|$)',
+        re.DOTALL,
+    )
+    for m in pattern.finditer(raw):
+        answer_text = m.group(2).strip()
+        if answer_text:
+            result[int(m.group(1))] = answer_text
+    return result
 
 
 def call_vision_model_claude(image_path: str, figure_count: int = 0,
