@@ -3,8 +3,8 @@ import '../common/FileInputGroup.css';
 import './PdfToImages.css';
 
 const MODEL_OPTIONS = [
-  { value: 'sonnet',    label: 'Claude Sonnet (recommended)' },
-  { value: 'haiku',     label: 'Claude Haiku (faster)' },
+  { value: 'haiku',     label: 'Claude Haiku (default)' },
+  { value: 'sonnet',    label: 'Claude Sonnet (more accurate)' },
   { value: 'gpt-4o',   label: 'GPT-4o' },
   { value: 'gpt-4o-mini', label: 'GPT-4o Mini' },
   { value: 'qwen2.5vl:7b', label: 'Ollama (local)' },

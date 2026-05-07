@@ -20,7 +20,7 @@ const PDFUploader = () => {
   // const [deploymentSlug, setDeploymentSlug] = useState('');
   const [singlePdf, setSinglePdf] = useState(null);
   const [mathpixModel, setMathpixModel] = useState('text');
-  const [pdfToImagesModel, setPdfToImagesModel] = useState('sonnet');
+  const [pdfToImagesModel, setPdfToImagesModel] = useState('haiku');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(false);
