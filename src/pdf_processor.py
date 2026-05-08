@@ -112,7 +112,7 @@ class PDFProcessor:
         lines = text.split('\n')
         return [line.strip() for line in lines if line.strip().startswith('Q:')]
 
-    def parse_answers(self, text: str) -> List[str]:
+    def parse_answers(self, text: str) -> dict:
         """
         Parse answers from extracted text.
 
@@ -123,14 +123,12 @@ class PDFProcessor:
         4. "Answer: X"
         5. Bare A/B/C/D lines
 
-        Returns list indexed by question number (index 0 = Q1's answer).
+        Returns dict[int, str] keyed by question number (e.g. {1: "A", 2: "3"}).
         """
         # ── 1. Same-line table: "1  3"  "2  2" (2+ spaces or tab between Q and answer)
         table_line = re.findall(r'^(\d+)[ \t]{2,}(\d+)\s*$', text, re.MULTILINE)
         if table_line:
-            answer_dict = {int(q): ans for q, ans in table_line}
-            max_num = max(answer_dict.keys())
-            return [answer_dict.get(i, "N/A") for i in range(1, max_num + 1)]
+            return {int(q): ans for q, ans in table_line}
 
         # ── 2. Alternating-line table after "Correct Answers" or "Answer Key" header
         header_match = re.search(r'(?:Correct Answers?|Answer Key)', text, re.IGNORECASE)
@@ -140,26 +138,22 @@ class PDFProcessor:
             num_lines = re.findall(r'^\s*(\d+)\s*$', after, re.MULTILINE)
             # Expect even count: Q, A, Q, A ...
             if len(num_lines) >= 2 and len(num_lines) % 2 == 0:
-                answer_dict = {int(num_lines[i]): num_lines[i + 1]
-                               for i in range(0, len(num_lines), 2)}
-                max_num = max(answer_dict.keys())
-                return [answer_dict.get(i, "N/A") for i in range(1, max_num + 1)]
+                return {int(num_lines[i]): num_lines[i + 1]
+                        for i in range(0, len(num_lines), 2)}
 
         # ── 3. JEE Main: "1. (2)"  or  "1. 12"  or  "1. 2.18"
         jee = re.findall(r'\b(\d+)\.\s+(\(\d+\)|\d+(?:\.\d+)?)', text)
         if jee:
-            answer_dict = {int(q): ans for q, ans in jee}
-            max_num = max(answer_dict.keys())
-            return [answer_dict.get(i, "N/A") for i in range(1, max_num + 1)]
+            return {int(q): ans for q, ans in jee}
 
         # ── 4. "Answer: X"
         letter_answers = re.findall(r'Answer:\s*([A-D])', text, re.IGNORECASE)
         if letter_answers:
-            return letter_answers
+            return {i + 1: v for i, v in enumerate(letter_answers)}
 
         # ── 5. Bare A/B/C/D lines
-        lines = text.split('\n')
-        return [line.strip() for line in lines if line.strip() in ['A', 'B', 'C', 'D']]
+        lines = [line.strip() for line in text.split('\n') if line.strip() in ['A', 'B', 'C', 'D']]
+        return {i + 1: v for i, v in enumerate(lines)}
 
     def process_and_export(self, output_excel_path: str) -> str:
         """
@@ -203,7 +197,7 @@ class PDFProcessor:
             
             # Add data rows
             for idx, question in enumerate(self.questions, 1):
-                answer = self.answers[idx - 1] if idx - 1 < len(self.answers) else "N/A"
+                answer = self.answers.get(idx, "N/A") if isinstance(self.answers, dict) else (self.answers[idx - 1] if idx - 1 < len(self.answers) else "N/A")
                 ws.append([idx, question, answer])
             
             # Adjust column widths

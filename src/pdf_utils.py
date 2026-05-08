@@ -151,7 +151,7 @@ def build_question_mapping(questions_path: str, answers_path: str, fig_data: lis
     against the question markers detected in the questions PDF.
     """
     processor = PDFProcessor(questions_path, answers_path)
-    answers_list = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
+    answers_dict = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
 
     doc = fitz.open(questions_path)
     pattern = _detect_q_pattern(doc)
@@ -167,7 +167,7 @@ def build_question_mapping(questions_path: str, answers_path: str, fig_data: lis
             if not m:
                 continue
             num = _q_num(m)
-            if expected_num is None or num == expected_num:
+            if expected_num is None or num >= expected_num:
                 markers.append((num, page_idx, block[1]))
                 expected_num = num + 1
     doc.close()
@@ -197,7 +197,7 @@ def build_question_mapping(questions_path: str, answers_path: str, fig_data: lis
         mapping.append({
             "question_num": q_num,
             "figure":       figs if figs else None,
-            "answer":       answers_list[q_num - 1] if q_num - 1 < len(answers_list) else "N/A",
+            "answer":       answers_dict.get(q_num, "N/A"),
         })
     return mapping
 
@@ -222,7 +222,7 @@ def build_pdf_map(questions_path: str, answers_path: str) -> list:
             if not m:
                 continue
             num = _q_num(m)
-            if expected_num is None or num == expected_num:
+            if expected_num is None or num >= expected_num:
                 markers.append((num, page_idx, block[1]))
                 expected_num = num + 1
 
@@ -231,7 +231,7 @@ def build_pdf_map(questions_path: str, answers_path: str) -> list:
     doc.close()
 
     processor    = PDFProcessor(questions_path, answers_path)
-    answers_list = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
+    answers_dict = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
 
     pdf_map = []
     for q_idx, (q_num, page_idx, y_top) in enumerate(markers):
@@ -248,9 +248,26 @@ def build_pdf_map(questions_path: str, answers_path: str) -> list:
             "end_page":     next_page_idx,
             "end_y":        next_y,
             "spans_pages":  next_page_idx != page_idx,
-            "answer":       answers_list[q_num - 1] if q_num - 1 < len(answers_list) else "N/A",
+            "answer":       answers_dict.get(q_num, "N/A"),
         })
     return pdf_map
+
+
+def _get_separator_ys(page) -> list:
+    """Return sorted y-centres of horizontal separator lines detected via fitz drawings.
+
+    A separator is a near-zero-height rect spanning at least half the page width.
+    """
+    ys = []
+    pw = page.rect.width
+    try:
+        for drawing in page.get_drawings():
+            r = drawing.get("rect")
+            if r and (r.y1 - r.y0) < 3 and (r.x1 - r.x0) > pw * 0.5:
+                ys.append((r.y0 + r.y1) / 2.0)
+    except Exception:
+        pass
+    return sorted(ys)
 
 
 def crop_from_map(pdf_path: str, output_dir: str, pdf_map: list) -> dict:
@@ -269,10 +286,14 @@ def crop_from_map(pdf_path: str, output_dir: str, pdf_map: list) -> dict:
         next_y        = entry["end_y"]
         out_path      = os.path.join(output_dir, f'question_{q_num:03d}.png')
         page_a        = doc[page_idx]
+        sep_ys_a      = _get_separator_ys(page_a)
 
         if not entry["spans_pages"]:
             # ── Same-page ────────────────────────────────────────────────────
-            raw_bottom = _content_bottom(page_a, y_top, next_y)
+            # Use the first separator line between this question and the next as the crop boundary.
+            between = [s for s in sep_ys_a if y_top < s < next_y]
+            sep_y   = between[0] if between else None
+            raw_bottom = _content_bottom(page_a, y_top, next_y, sep_y)
             y0 = max(0.0, y_top - 5)
             y1 = min(page_a.rect.height, raw_bottom + 5)
             if y1 - y0 < 1:
@@ -477,9 +498,13 @@ def extract_question_texts_from_pdf(pdf_path: str) -> dict:
     return texts
 
 
-def _content_bottom(page, y_start: float, y_limit: float) -> float:
+def _content_bottom(page, y_start: float, y_limit: float,
+                    sep_y: float | None = None) -> float:
     """Return the y-bottom of the last content block (text or image) whose top
-    falls in [y_start, y_limit).  Returns y_start when no blocks are found."""
+    falls in [y_start, y_limit).  Returns y_start when no blocks are found.
+    sep_y: if provided, caps y_limit at the separator line so crops don't bleed past it."""
+    if sep_y is not None:
+        y_limit = min(y_limit, sep_y)
     bottom = y_start
     for block in page.get_text("blocks"):
         if block[1] < y_start or block[1] >= y_limit:

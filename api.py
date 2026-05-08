@@ -192,7 +192,7 @@ def extract_qa():
         questions_md   = parse_pdf(questions_path)["markdown"]
         processor      = PDFProcessor(questions_path, answers_path)
         questions_list = processor.parse_questions(questions_md)
-        answers_list   = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
+        answers_dict   = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
 
         if not questions_list:
             return jsonify({"error": "No questions could be extracted from the PDF"}), 422
@@ -214,7 +214,7 @@ def extract_qa():
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
         for idx, question in enumerate(questions_list, start=1):
-            answer = answers_list[idx - 1] if idx - 1 < len(answers_list) else "N/A"
+            answer = answers_dict.get(idx, "N/A")
             urls   = FIGURE_URL_RE.findall(question)
             q_text = latex_to_unicode(sanitize(inline_fig_labels(question)))
 
@@ -825,7 +825,7 @@ def _run_pdf_pipeline(questions_path: str, answers_path: str,
     crop_by_qnum = crop_from_map(questions_path, questions_dir, pdf_map)
     fig_data     = extract_figures_from_pdf(questions_path, figures_dir)
     mapping      = build_question_mapping(questions_path, answers_path, fig_data)
-    return crop_by_qnum, mapping
+    return crop_by_qnum, mapping, fig_data
 
 
 def _extraction_summary(result: list) -> str:
@@ -870,6 +870,11 @@ def _ans_from_rubric(text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _fig_zip_path(abs_path: str) -> str:
+    """Return the ZIP-relative path for a figure file (e.g. 'figures/figure_001.png')."""
+    return f"figures/{os.path.basename(abs_path)}"
+
+
 def _transcribe_entry(entry: dict, crop_by_qnum: dict, model: str,
                       pdf_texts: dict = None) -> dict:
     q_num = entry["question_num"]
@@ -877,6 +882,7 @@ def _transcribe_entry(entry: dict, crop_by_qnum: dict, model: str,
 
     crop_path  = crop_by_qnum.get(q_num)
     crop_name  = os.path.basename(crop_path) if crop_path else ""
+    crop_zip   = f"questions/{crop_name}" if crop_name else ""
 
     # Try PyMuPDF embedded text first
     if pdf_texts:
@@ -885,8 +891,8 @@ def _transcribe_entry(entry: dict, crop_by_qnum: dict, model: str,
             return {
                 "question_num":   str(q_num),
                 "question_text":  sanitize(latex_to_unicode(raw)),
-                "question_image": crop_name,
-                "figures":        ", ".join(os.path.basename(p) for p in figs),
+                "question_image": crop_zip,
+                "figures":        ", ".join(_fig_zip_path(p) for p in figs),
                 "answers":        sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
                 "source":         "pymupdf",
             }
@@ -907,8 +913,8 @@ def _transcribe_entry(entry: dict, crop_by_qnum: dict, model: str,
     return {
         "question_num":   str(q_num),
         "question_text":  sanitize(latex_to_unicode(q_text)),
-        "question_image": crop_name,
-        "figures":        ", ".join(os.path.basename(p) for p in figs),
+        "question_image": crop_zip,
+        "figures":        ", ".join(_fig_zip_path(p) for p in figs),
         "answers":        sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
         "source":         source,
     }
@@ -925,32 +931,55 @@ def _transcribe_all_parallel(mapping: list, crop_by_qnum: dict, model: str,
 
 
 _VAL_FILLS = {
-    "OK":             PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
-    "Missing Answer": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
-    "Missing Text":   PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid"),
-    "Missing Both":   PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+    "OK":                 PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
+    "Missing Answer":     PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+    "Missing Text":       PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid"),
+    "Missing Both":       PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+    "Bad Image Path":     PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid"),
+    "Invalid MCQ Answer": PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid"),
 }
 _VAL_FONTS = {
-    "OK":             Font(color="006100", bold=True),
-    "Missing Answer": Font(color="9C6500", bold=True),
-    "Missing Text":   Font(color="974706", bold=True),
-    "Missing Both":   Font(color="9C0006", bold=True),
+    "OK":                 Font(color="006100", bold=True),
+    "Missing Answer":     Font(color="9C6500", bold=True),
+    "Missing Text":       Font(color="974706", bold=True),
+    "Missing Both":       Font(color="9C0006", bold=True),
+    "Bad Image Path":     Font(color="595959", bold=True),
+    "Invalid MCQ Answer": Font(color="CC0000", bold=True),
 }
 
+_MCQ_OPT_RE = _re.compile(r'(?:^|\n)\s*(?:\(?)[A-D]\)?[\.\)]\s', _re.IGNORECASE)
+_MCQ_ANS_RE = _re.compile(r'^[A-D\d]$', _re.IGNORECASE)
 
-def _validate_extraction(result: list) -> dict:
-    """Check each result entry for question text and answer completeness.
+
+def _validate_extraction(result: list, zip_manifest: set = None) -> dict:
+    """Check each result entry for question text, answer completeness, image paths, and MCQ answers.
 
     Adds a 'validation' field to every entry in-place.
-    Returns counts: {total, ok, missing_answer, missing_text, missing_both}.
+    Returns counts dict.
     """
     counts = {"total": len(result), "ok": 0,
-              "missing_answer": 0, "missing_text": 0, "missing_both": 0}
+              "missing_answer": 0, "missing_text": 0, "missing_both": 0,
+              "bad_image_path": 0, "invalid_mcq_answer": 0, "sequence_gaps": []}
     for entry in result:
-        text = str(entry.get("question_text", "")).strip()
-        ans  = str(entry.get("answers",       "")).strip()
+        text     = str(entry.get("question_text", "")).strip()
+        ans      = str(entry.get("answers",       "")).strip()
+        img_path = str(entry.get("question_image", "")).strip()
         has_text = bool(text) and text.lower() not in ("nan", "none", "") and len(text) > 5
         has_ans  = bool(ans)  and ans.lower()  not in ("nan", "none", "n/a", "")
+
+        # Image path check: if we have a manifest, verify the path is in it
+        if img_path and zip_manifest is not None and img_path not in zip_manifest:
+            entry["validation"] = "Bad Image Path"
+            counts["bad_image_path"] += 1
+            continue
+
+        # MCQ answer check: if question has A)/B)/C)/D) options, answer must be a single letter/digit
+        is_mcq = bool(_MCQ_OPT_RE.search(text))
+        if is_mcq and has_ans and not _MCQ_ANS_RE.match(ans):
+            entry["validation"] = "Invalid MCQ Answer"
+            counts["invalid_mcq_answer"] += 1
+            continue
+
         if has_text and has_ans:
             entry["validation"] = "OK";             counts["ok"]             += 1
         elif has_text:
@@ -959,6 +988,20 @@ def _validate_extraction(result: list) -> dict:
             entry["validation"] = "Missing Text";   counts["missing_text"]   += 1
         else:
             entry["validation"] = "Missing Both";   counts["missing_both"]   += 1
+
+    # Sequential gap check
+    nums = []
+    for e in result:
+        try:
+            nums.append(int(e["question_num"]))
+        except (ValueError, KeyError, TypeError):
+            pass
+    nums.sort()
+    counts["sequence_gaps"] = [
+        nums[i + 1] - nums[i]
+        for i in range(len(nums) - 1)
+        if nums[i + 1] - nums[i] > 1
+    ]
     return counts
 
 
@@ -1043,19 +1086,25 @@ def _write_questions_excel(result: list, output_path: str) -> None:
     ma_count  = sum(1 for e in result if e.get("validation") == "Missing Answer")
     mt_count  = sum(1 for e in result if e.get("validation") == "Missing Text")
     mb_count  = sum(1 for e in result if e.get("validation") == "Missing Both")
+    bip_count = sum(1 for e in result if e.get("validation") == "Bad Image Path")
+    imq_count = sum(1 for e in result if e.get("validation") == "Invalid MCQ Answer")
 
     rows = [
-        ("Total questions",      total,    "100%"),
-        ("OK (text + answer)",   ok_count, pct(ok_count)),
-        ("Missing Answer",       ma_count, pct(ma_count)),
-        ("Missing Text",         mt_count, pct(mt_count)),
-        ("Missing Both",         mb_count, pct(mb_count)),
+        ("Total questions",      total,     "100%"),
+        ("OK (text + answer)",   ok_count,  pct(ok_count)),
+        ("Missing Answer",       ma_count,  pct(ma_count)),
+        ("Missing Text",         mt_count,  pct(mt_count)),
+        ("Missing Both",         mb_count,  pct(mb_count)),
+        ("Bad Image Path",       bip_count, pct(bip_count)),
+        ("Invalid MCQ Answer",   imq_count, pct(imq_count)),
     ]
     fill_map = {
         "OK (text + answer)": _VAL_FILLS["OK"],
         "Missing Answer":     _VAL_FILLS["Missing Answer"],
         "Missing Text":       _VAL_FILLS["Missing Text"],
         "Missing Both":       _VAL_FILLS["Missing Both"],
+        "Bad Image Path":     _VAL_FILLS["Bad Image Path"],
+        "Invalid MCQ Answer": _VAL_FILLS["Invalid MCQ Answer"],
     }
     for label, count, pct_str in rows:
         sv.append([label, count, pct_str])
@@ -1267,15 +1316,25 @@ def pdf_to_images():
         # falls back to Claude vision only for scanned/unreadable questions.
         result = _transcribe_all_parallel(mapping, crop_by_qnum, model, pdf_texts)
 
-        _validate_extraction(result)
+        # Bundle: full page images + question crops + Excel into one ZIP
+        page_pngs = _render_full_pages(questions_path, questions_dir)
 
-        # Write full Excel (same format as extract-single)
+        # Pre-compute manifest for validator
+        zip_manifest: set = set()
+        for p in page_pngs:
+            if os.path.exists(p):
+                zip_manifest.add(f"pages/{os.path.basename(p)}")
+        for q_num in sorted(crop_by_qnum.keys()):
+            cp = crop_by_qnum[q_num]
+            if os.path.exists(cp):
+                zip_manifest.add(f"questions/{os.path.basename(cp)}")
+
+        _validate_extraction(result, zip_manifest)
+
         excel_path = os.path.join(app.config['UPLOAD_FOLDER'], 'extraction_results.xlsx')
         _write_questions_excel(result, excel_path)
 
-        # Bundle: full page images + question crops + Excel into one ZIP
-        page_pngs = _render_full_pages(questions_path, questions_dir)
-        zip_path  = os.path.join(app.config['UPLOAD_FOLDER'], 'question_crops.zip')
+        zip_path = os.path.join(app.config['UPLOAD_FOLDER'], 'question_crops.zip')
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for p in page_pngs:
                 if os.path.exists(p):
@@ -1324,7 +1383,7 @@ def extract_single():
         pdf_file.save(pdf_path)
 
         questions_dir, figures_dir = _prepare_work_dirs(os.getcwd())
-        crop_by_qnum, mapping = _run_pdf_pipeline(pdf_path, pdf_path, questions_dir, figures_dir)
+        crop_by_qnum, mapping, fig_data = _run_pdf_pipeline(pdf_path, pdf_path, questions_dir, figures_dir)
 
         vision_path = not bool(mapping)
         if vision_path:
@@ -1334,23 +1393,35 @@ def extract_single():
             pdf_texts = extract_question_texts_from_pdf(pdf_path)
             result = _transcribe_all_parallel(mapping, crop_by_qnum, model, pdf_texts)
 
-        # Render full-res pages (150 dpi) for the ZIP and — on vision path —
-        # use them to crop each question between its separator lines.
+        # Render full-res pages (150 dpi) for the ZIP and use them to refine
+        # question crops using separator lines (both vision and text paths).
         page_pngs = _render_full_pages(pdf_path, questions_dir)
-        if vision_path:
-            _crop_questions_by_separators(result, crop_by_qnum, questions_dir)
+        _crop_questions_by_separators(result, crop_by_qnum, questions_dir)
 
         # Strip pipeline-internal fields before writing Excel.
         for _e in result:
             _e.pop("_page_idx", None)
             _e.pop("_y_px", None)
 
-        _validate_extraction(result)
+        # Pre-compute zip_manifest from known paths so validation can check image paths.
+        zip_manifest: set = set()
+        for p in page_pngs:
+            if os.path.exists(p):
+                zip_manifest.add(f"pages/{os.path.basename(p)}")
+        for q_num in sorted(crop_by_qnum.keys()):
+            cp = crop_by_qnum[q_num]
+            if os.path.exists(cp):
+                zip_manifest.add(f"questions/{os.path.basename(cp)}")
+        if not vision_path:
+            for _, _, fig_abs in (fig_data or []):
+                if os.path.exists(fig_abs):
+                    zip_manifest.add(_fig_zip_path(fig_abs))
 
+        _validate_extraction(result, zip_manifest)
         excel_path = os.path.join(app.config['UPLOAD_FOLDER'], 'single_pdf_output.xlsx')
         _write_questions_excel(result, excel_path)
 
-        # Bundle: full page images + per-question crops (vision or text) + Excel.
+        # Bundle: full page images + per-question crops + figures + Excel.
         zip_path = os.path.join(app.config['UPLOAD_FOLDER'], 'single_pdf_output.zip')
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for p in page_pngs:
@@ -1360,6 +1431,10 @@ def extract_single():
                 crop_path = crop_by_qnum[q_num]
                 if os.path.exists(crop_path):
                     zf.write(crop_path, f"questions/{os.path.basename(crop_path)}")
+            if not vision_path:
+                for _, _, fig_abs in (fig_data or []):
+                    if os.path.exists(fig_abs):
+                        zf.write(fig_abs, _fig_zip_path(fig_abs))
             zf.write(excel_path, 'extraction_results.xlsx')
 
         response = send_file(
@@ -1385,6 +1460,7 @@ def _transcribe_entry_mathpix(entry: dict, crop_by_qnum: dict, model: str) -> di
     q_num     = entry["question_num"]
     crop_path = crop_by_qnum.get(q_num)
     crop_name = os.path.basename(crop_path) if crop_path else ""
+    crop_zip  = f"questions/{crop_name}" if crop_name else ""
     figs = entry.get("figure") or []
     if crop_path and os.path.exists(crop_path):
         try:
@@ -1396,9 +1472,10 @@ def _transcribe_entry_mathpix(entry: dict, crop_by_qnum: dict, model: str) -> di
     return {
         "question_num":   str(q_num),
         "question_text":  sanitize(latex_to_unicode(q_text)),
-        "question_image": crop_name,
-        "figures":        ", ".join(os.path.basename(p) for p in figs),
+        "question_image": crop_zip,
+        "figures":        ", ".join(_fig_zip_path(p) for p in figs),
         "answers":        sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
+        "source":         "mathpix",
     }
 
 
@@ -1431,7 +1508,7 @@ def extract_mathpix():
         answers_file.save(answers_path)
 
         questions_dir, figures_dir = _prepare_work_dirs(os.getcwd())
-        crop_by_qnum, mapping = _run_pdf_pipeline(
+        crop_by_qnum, mapping, fig_data = _run_pdf_pipeline(
             questions_path, answers_path, questions_dir, figures_dir,
         )
         result = _transcribe_all_mathpix_parallel(mapping, crop_by_qnum, model)
@@ -1509,9 +1586,9 @@ def validate_qa():
         if not crop_by_qnum:
             return jsonify({"error": "No questions could be detected in questions_pdf"}), 422
 
-        # ── Parse answers from answers PDF (index-based: Q1 → index 0) ───────
+        # ── Parse answers from answers PDF keyed by question number ──────────
         processor    = PDFProcessor(questions_path, answers_path)
-        answers_list = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
+        answers_dict = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
 
         # ── Load Excel ────────────────────────────────────────────────────────
         df   = pd.read_excel(excel_path)
@@ -1549,9 +1626,7 @@ def validate_qa():
             excel_a    = exc_entry["answer"]
             excel_figs = exc_entry["figures"]
 
-            pdf_a          = sanitize(latex_to_unicode(
-                answers_list[q_num - 1] if (q_num - 1) < len(answers_list) else "N/A"
-            ))
+            pdf_a          = sanitize(latex_to_unicode(answers_dict.get(q_num, "N/A")))
             crop_path      = crop_by_qnum.get(q_num)
             extracted_figs = q_figures_by_num.get(q_num, [])
 

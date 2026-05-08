@@ -25,6 +25,10 @@ For each question on this page:
 the very top of the image.
 3. Extract the COMPLETE question text including all sub-parts, answer options \
 (A/B/C/D or 1/2/3/4), marks in brackets, and any instructions.
+   For MCQ questions: output the stem first, then each option on its own line \
+as "A) ...", "B) ...", "C) ...", "D) ..." (or numbered 1)/2)/3)/4)). \
+ALL options MUST stay inside the same QUESTION block as the stem — never \
+split them into separate question entries.
 4. Write math in plain Unicode — fractions as (a)/(b), exponents as ^N, \
 square roots as sqrt(x). No LaTeX, no backslashes.
 5. If a figure, diagram, graph, or image appears anywhere inside the question or \
