@@ -48,15 +48,22 @@ A page may have a logo, header, or branding at the top — ignore those and focu
 on the main body content.
 
 Classify the page as exactly one of:
-- "questions" — the main body contains numbered exam questions for students to answer \
-  (even if there is a logo, subject heading, or marks in brackets alongside the questions)
-- "answers"   — the main body contains an answer key, correct answers table, solutions, \
-  model answers, worked examples, or a marking scheme
+- "questions" — the main body contains numbered exam questions for students to answer. \
+  Mark allocations like "[2]" or "(2 marks)" after a question stem are normal and do NOT \
+  make it an answers page.
+- "answers"   — the main body contains any of: an answer key table, correct-answer list, \
+  worked solutions, model answers, OR a marking rubric where solution steps are written as \
+  "Writes that …", "Finds …", "Calculates …", "Solves …", "Assumes …", "Identifies …", \
+  "Draws …", "Hence …", "Therefore …", or similar, each followed by a mark allocation \
+  in square brackets like [0.5] or [1]. A page is "answers" even if question numbers appear \
+  alongside the rubric steps.
 - "other"     — the page is purely a cover, title page, blank page, syllabus, \
   table of contents, or instructions with no actual questions or answers
 
 When in doubt between "questions" and "other", choose "questions" if you can see \
 any numbered items that look like exam questions.
+When in doubt between "questions" and "answers", choose "answers" if the lines \
+describe solution steps with mark allocations.
 
 Output ONLY the single word: questions, answers, or other\
 """
@@ -66,22 +73,27 @@ This page contains answers or solutions to exam questions.
 
 For each question that has an answer on this page:
 1. Identify the question number.
-2. Extract the COMPLETE answer — this may be a single letter or number, a word, \
-a full sentence, multiple lines of working, or a combination of text and figures. \
-Include all steps, explanations, and sub-parts.
-3. If the answer includes a diagram, graph, image, or drawn figure, \
-write [Figure] at that position in the text.
-4. Write math in plain Unicode — fractions as (a)/(b), exponents as ^N, \
-square roots as sqrt(x). No LaTeX, no backslashes.
-5. Do NOT include mark allocations (e.g. "(2 marks)", "[1]") as part of the answer text.
+2. Extract the answer following these rules by page type:
+   a) MCQ answer key (table of "Q. No | Answer"): extract just the option number or letter.
+   b) Short-answer key: extract the value or brief answer.
+   c) Rubric / marking scheme (lines like "Writes that …", "Finds …", "Calculates …"):
+      extract ONLY the final answer or key result — the specific value, measurement, or
+      conclusion the student must reach. Do NOT copy the full rubric steps.
+      Example: if the rubric says "Finds the length of RP as RS + PS = 9 + 9 = 18 cm. [0.5]",
+      extract "18 cm".
+      Example: if it says "Writes that the two triangles are similar by AA criterion.",
+      extract "Similar by AA criterion".
+3. If the answer includes a diagram write [Figure].
+4. Write math in plain Unicode — fractions as (a)/(b), exponents as ^N, sqrt(x). No LaTeX.
+5. Do NOT include mark allocations like "(2 marks)" or "[1]".
 
 Output ONLY in this exact format — one block per answer, nothing else:
 
 ANSWER 1:
-[complete answer for question 1]
+[answer for question 1]
 
 ANSWER 2:
-[complete answer for question 2]
+[answer for question 2]
 
 Use the actual question number from the page.\
 """

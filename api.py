@@ -32,6 +32,7 @@ from src.pdf_utils import (
     extract_question_texts_from_pdf,
     pdf_pages_to_png, save_page_crops, detect_layout_fitz,
     extract_figures_from_pages, map_figures_to_questions_on_pages,
+    build_pdf_map, crop_from_map,
 )
 from src.vision import call_vision, _MODEL_ALIASES
 from src.mathpix import call_mathpix
@@ -150,6 +151,20 @@ def internal_error(error):
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.route('/', methods=['GET'])
+def root():
+    frontend_build = os.path.join(os.path.dirname(__file__), 'frontend', 'dist', 'index.html')
+    if os.path.exists(frontend_build):
+        return send_file(frontend_build)
+    return jsonify({
+        "service": "QA-PDF-Extractor-API",
+        "status": "running",
+        "note": "Open http://localhost:3000 for the UI, or call /api/* endpoints directly.",
+        "endpoints": ["/health", "/api/extract-single", "/api/extract", "/api/pdf-to-images",
+                      "/api/validate", "/api/extract-mathpix", "/api/general-purpose-extraction"],
+    }), 200
+
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -593,7 +608,40 @@ def _is_mcq_answer_table_page(page_text_lower: str) -> bool:
     return is_mcq and not is_scheme
 
 
-def _vision_pipeline_for_scanned_pdf(pdf_path: str, questions_dir: str, model: str) -> list:
+def _detect_chapter_boundaries(pdf_path: str) -> list:
+    """Return [(page_idx, chapter_num), ...] for each chapter start, sorted by page_idx.
+
+    Detects 'Chapter - N' markers from extractable PDF text (chapter title pages
+    always have selectable text even when question content is image-based).
+    """
+    import fitz as _fitz
+    _re_chap = _re.compile(r'Chapter\s*[-–]\s*(\d+)', _re.IGNORECASE)
+    doc  = _fitz.open(pdf_path)
+    seen: set = set()
+    out:  list = []
+    for i, page in enumerate(doc):
+        m = _re_chap.search(page.get_text())
+        if m:
+            ch = int(m.group(1))
+            if ch not in seen:
+                seen.add(ch)
+                out.append((i, ch))
+    doc.close()
+    return out
+
+
+def _chapter_of(page_idx: int, boundaries: list) -> int:
+    """Return the chapter number for page_idx given a sorted boundaries list."""
+    ch = 1
+    for pg, ch_num in boundaries:
+        if pg <= page_idx:
+            ch = ch_num
+        else:
+            break
+    return ch
+
+
+def _vision_pipeline_for_scanned_pdf(pdf_path: str, questions_dir: str, model: str) -> tuple:
     """Full vision-based Q&A extraction for PDFs where PyMuPDF can't read the text.
 
     Renders ALL pages to images, classifies each page via Claude as 'questions',
@@ -602,7 +650,11 @@ def _vision_pipeline_for_scanned_pdf(pdf_path: str, questions_dir: str, model: s
     - answer pages    → extract full answers (single-word, multi-line, or with figures)
     - other pages     → skip
 
-    Returns a result list in the same format as _transcribe_all_parallel.
+    Each question is linked to the full-page PNG it was found on (stored under
+    pages/ in the output ZIP by _render_full_pages), since y_px estimates from
+    vision models are not accurate enough for per-question sub-crops.
+
+    Returns (result_list, crop_by_qnum) where crop_by_qnum maps q_num → full-page PNG.
     """
     from src.claude_vision import (
         extract_questions_from_page_claude,
@@ -611,86 +663,181 @@ def _vision_pipeline_for_scanned_pdf(pdf_path: str, questions_dir: str, model: s
 
     resolved_model = _MODEL_ALIASES.get(model, model)
 
-    # Step 1: render all pages
-    page_records    = _render_all_pages(pdf_path, questions_dir, scale=2.0)
+    # Pre-scan for chapter boundaries (e.g. "Chapter - 1", "Chapter - 2").
+    # When found, question numbers are prefixed "Ch{N}-Q{M}" to avoid collisions.
+    chapter_boundaries = _detect_chapter_boundaries(pdf_path)
+    multi_chapter      = len(chapter_boundaries) > 1
+
+    # Step 1: render all pages (1× scale keeps image ≤ 1568 px tall — no API resize)
+    page_records    = _render_all_pages(pdf_path, questions_dir, scale=1.0)
 
     # Step 2: classify all pages in parallel
     classifications = _classify_pages_vision(page_records, resolved_model)
 
-    q_imgs = [r[1] for r in page_records if classifications.get(r[0]) in ("questions", "other")]
-    a_imgs = [r[1] for r in page_records if classifications.get(r[0]) == "answers"]
-    # "other" pages are attempted for question extraction too — marks like [1][2][3]
-    # beside questions can make the classifier label a question page as "other".
+    q_records = [r for r in page_records if classifications.get(r[0]) in ("questions", "other")]
+    a_records = [r for r in page_records if classifications.get(r[0]) == "answers"]
 
-    # Step 3a: extract answers from answer pages (sequential — usually few pages)
+    # Step 3a: extract answers — key by "Ch{N}-{q_num}" when multi-chapter.
+    # Images are NOT deleted here; Step 3c reuses them for question extraction.
     answers_dict: dict = {}
-    for img_path in a_imgs:
+    for record in a_records:
+        page_idx, img_path = record[0], record[1]
+        ch = _chapter_of(page_idx, chapter_boundaries)
         try:
-            answers_dict.update(extract_answers_from_page_claude(img_path, resolved_model))
+            raw = extract_answers_from_page_claude(img_path, resolved_model)
+            for q_num, ans in raw.items():
+                key = f"Ch{ch}-Q{q_num}" if multi_chapter else q_num
+                answers_dict[key] = ans
         except Exception:
             pass
+
+    # Step 3b: extract questions from question/other pages (parallel, with retry).
+    # If ALL extracted entries look like rubrics the page was misclassified — also run
+    # answer extraction before deleting the image so the answers aren't lost.
+    def _extract_q(record) -> tuple:
+        import time
+        page_idx, img_path = record[0], record[1]
+        ch = _chapter_of(page_idx, chapter_boundaries)
+        entries = []
+        for attempt in range(3):
+            try:
+                entries = extract_questions_from_page_claude(img_path, resolved_model)
+                break
+            except Exception:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)   # 1s, 2s
+        for e in entries:
+            e["_page_idx"] = page_idx
+            e["_chapter"]  = ch
+        # Dual extraction: when every entry looks like a rubric the page is actually
+        # an answer page; run answer extraction before the image is deleted.
+        extra_answers: dict = {}
+        if entries and all(_is_rubric(e.get("question_text", "")) for e in entries):
+            try:
+                raw_ans = extract_answers_from_page_claude(img_path, resolved_model)
+                for q_num, ans in raw_ans.items():
+                    key = f"Ch{ch}-Q{q_num}" if multi_chapter else q_num
+                    extra_answers[key] = ans
+            except Exception:
+                pass
         try:
             os.remove(img_path)
         except Exception:
             pass
-
-    # Step 3b: extract questions from question pages (parallel)
-    def _extract_q(img_path: str) -> list:
-        try:
-            return extract_questions_from_page_claude(img_path, resolved_model)
-        except Exception:
-            return []
-        finally:
-            try:
-                os.remove(img_path)
-            except Exception:
-                pass
+        return entries, extra_answers
 
     with ThreadPoolExecutor(max_workers=_VISION_MAX_WORKERS) as executor:
-        futures = [executor.submit(_extract_q, p) for p in q_imgs]
+        futures = [executor.submit(_extract_q, r) for r in q_records]
     all_questions = []
     for f in futures:
-        all_questions.extend(f.result())
+        q_entries, extra_ans = f.result()
+        all_questions.extend(q_entries)
+        for key, ans in extra_ans.items():
+            if key not in answers_dict:
+                answers_dict[key] = ans
 
-    all_questions.sort(key=lambda q: q["question_num"])
+    # Step 3c: also run question extraction on answer-classified pages.
+    # Some exam layouts put the question stem and its rubric on the same page; the
+    # classifier labels the whole page "answers" and the question gets missed.
+    # We keep only non-rubric entries to avoid re-adding solution text as questions.
+    with ThreadPoolExecutor(max_workers=_VISION_MAX_WORKERS) as executor:
+        a_futures = [executor.submit(_extract_q, r) for r in a_records]
+    for f in a_futures:
+        q_entries, extra_ans = f.result()
+        real_qs = [e for e in q_entries if not _is_rubric(e.get("question_text", ""))]
+        all_questions.extend(real_qs)
+        for key, ans in extra_ans.items():
+            if key not in answers_dict:
+                answers_dict[key] = ans
 
+    # Sort by (chapter, question_num) so output is in reading order.
+    all_questions.sort(key=lambda q: (q.get("_chapter", 1), q["question_num"]))
+
+    # Deduplicate: the same question number can appear on both the question page and the
+    # answer/rubric page (which sometimes gets misclassified as a question page).
+    # Keep the non-rubric entry; if its answer is missing, borrow from rubric text.
+    from collections import defaultdict as _defaultdict
+    _grp: dict = _defaultdict(list)
+    for _q in all_questions:
+        _grp[(int(_q.get("_chapter", 1)), int(_q["question_num"]))].append(_q)
+
+    _deduped = []
+    for (_ch_k, _qn_k), _g in sorted(_grp.items()):
+        if len(_g) == 1:
+            _deduped.append(_g[0])
+            continue
+        _real = [q for q in _g if not _is_rubric(q.get("question_text", ""))]
+        _rubs = [q for q in _g if _is_rubric(q.get("question_text", ""))]
+        _best = _real[0] if _real else _g[0]
+        # Rescue answer from rubric when answer is missing
+        _ans_k = f"Ch{_ch_k}-Q{_qn_k}" if multi_chapter else _qn_k
+        if str(answers_dict.get(_ans_k, "N/A")) in ("N/A", "nan", "", "None"):
+            for _r in _rubs:
+                _ext = _ans_from_rubric(_r.get("question_text", ""))
+                if _ext:
+                    answers_dict[_ans_k] = _ext
+                    break
+        _deduped.append(_best)
+
+    all_questions = _deduped
+
+    # Build result + crop map (each question → full page PNG under pages/)
+    crop_by_qnum: dict = {}
     result = []
     for q in all_questions:
-        q_num  = q["question_num"]
-        answer = answers_dict.get(q_num, "N/A")
+        q_num    = q["question_num"]
+        ch       = q.get("_chapter", 1)
+        page_idx = q.get("_page_idx", 0)
+        q_id     = f"Ch{ch}-Q{q_num}" if multi_chapter else str(q_num)
+        ans_key  = f"Ch{ch}-Q{q_num}" if multi_chapter else q_num
+        answer   = answers_dict.get(ans_key, "N/A")
+        # Page PNG path matches _render_full_pages naming: page_001.png, page_002.png, …
+        page_png = os.path.join(questions_dir, f"page_{page_idx + 1:03d}.png")
+        crop_by_qnum[q_id] = page_png
         result.append({
-            "question_num":  str(q_num),
-            "question_text": sanitize(latex_to_unicode(q["question_text"])),
-            "answers":       sanitize(latex_to_unicode(str(answer))),
-            "figures":       "",
-            "source":        "vision (no extractable text)",
+            "question_num":   q_id,
+            "question_text":  sanitize(latex_to_unicode(q["question_text"])),
+            "question_image": f"pages/page_{page_idx + 1:03d}.png",
+            "figures":        "",
+            "answers":        sanitize(latex_to_unicode(str(answer))),
+            "source":         "vision (no extractable text)",
+            # Private fields used by _crop_questions_by_separators; stripped before Excel.
+            "_page_idx":      page_idx,
+            "_y_px":          q.get("y_px", 0),
         })
-    return result
+    return result, crop_by_qnum
 
 
 def _prepare_work_dirs(base_dir: str) -> tuple:
-    questions_dir = os.path.join(base_dir, 'questions')
-    figures_dir   = os.path.join(base_dir, 'figures')
+    import uuid
+    # Unique per-request subdirectory avoids file collisions under concurrent requests.
+    req_id        = uuid.uuid4().hex[:12]
+    questions_dir = os.path.join(base_dir, 'questions', req_id)
+    figures_dir   = os.path.join(base_dir, 'figures',   req_id)
     os.makedirs(questions_dir, exist_ok=True)
-    os.makedirs(figures_dir, exist_ok=True)
+    os.makedirs(figures_dir,   exist_ok=True)
     return questions_dir, figures_dir
 
 
 def _run_pdf_pipeline(questions_path: str, answers_path: str,
                       questions_dir: str, figures_dir: str) -> tuple:
-    crop_by_qnum = crop_questions_from_pdf(questions_path, questions_dir)
+    pdf_map      = build_pdf_map(questions_path, answers_path)
+    crop_by_qnum = crop_from_map(questions_path, questions_dir, pdf_map)
     fig_data     = extract_figures_from_pdf(questions_path, figures_dir)
     mapping      = build_question_mapping(questions_path, answers_path, fig_data)
     return crop_by_qnum, mapping
 
 
 def _extraction_summary(result: list) -> str:
-    """Return a compact header value describing how questions were extracted."""
+    """Return a compact header value describing extraction counts and validation stats."""
     pdf_count    = sum(1 for r in result if r.get("source") == "pymupdf")
     vision_count = sum(1 for r in result if r.get("source", "").startswith("vision"))
     reasons      = list({r["source"] for r in result if r.get("source", "").startswith("vision")})
     reason_str   = "; ".join(reasons) if reasons else ""
-    return f"pdf:{pdf_count},vision:{vision_count},reasons:{reason_str}"
+    ok_count     = sum(1 for r in result if r.get("validation") == "OK")
+    no_ans       = sum(1 for r in result if r.get("validation") == "Missing Answer")
+    return (f"pdf:{pdf_count},vision:{vision_count},reasons:{reason_str}"
+            f"|ok:{ok_count},missing_answer:{no_ans}")
 
 
 def _is_useful_text(text: str) -> bool:
@@ -701,25 +848,50 @@ def _is_useful_text(text: str) -> bool:
     return printable / len(text) > 0.6
 
 
+import re as _re
+_RUBRIC_LEAD_RE = _re.compile(
+    r'^\s*(Writes that|Finds |Calculates|Uses the|Shows that|Proves that|'
+    r'Teacher should award|Assumes|Identifies|Substitutes|Solves|Expands|'
+    r'Draws a|Justif|Hence|Therefore|Note:.*mark)'
+    r'|\[\s*\d+\.?\d*\s*\]',   # mark allocations like [0.5] [1] [2]
+    _re.IGNORECASE | _re.MULTILINE,
+)
+_ANS_KEY_RE = _re.compile(r'\[Answer Key\s*[-–]\s*Correct answer:\s*(\S+?)\]', _re.IGNORECASE)
+
+
+def _is_rubric(text: str) -> bool:
+    """True when extracted text looks like a teacher solution rubric, not a question."""
+    return bool(_RUBRIC_LEAD_RE.search(str(text)[:400]))
+
+
+def _ans_from_rubric(text: str) -> str | None:
+    """Extract MCQ answer from '[Answer Key - Correct answer: N]' pattern."""
+    m = _ANS_KEY_RE.search(str(text))
+    return m.group(1) if m else None
+
+
 def _transcribe_entry(entry: dict, crop_by_qnum: dict, model: str,
                       pdf_texts: dict = None) -> dict:
     q_num = entry["question_num"]
     figs  = entry.get("figure") or []
+
+    crop_path  = crop_by_qnum.get(q_num)
+    crop_name  = os.path.basename(crop_path) if crop_path else ""
 
     # Try PyMuPDF embedded text first
     if pdf_texts:
         raw = pdf_texts.get(q_num, "")
         if _is_useful_text(raw):
             return {
-                "question_num":  str(q_num),
-                "question_text": sanitize(latex_to_unicode(raw)),
-                "answers":       sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
-                "figures":       ", ".join(os.path.basename(p) for p in figs),
-                "source":        "pymupdf",
+                "question_num":   str(q_num),
+                "question_text":  sanitize(latex_to_unicode(raw)),
+                "question_image": crop_name,
+                "figures":        ", ".join(os.path.basename(p) for p in figs),
+                "answers":        sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
+                "source":         "pymupdf",
             }
 
     # Fall back to Claude Haiku vision
-    crop_path = crop_by_qnum.get(q_num)
     reason = "no embedded text" if not (pdf_texts and pdf_texts.get(q_num)) else "text too short/garbled"
     if crop_path and os.path.exists(crop_path):
         try:
@@ -733,11 +905,12 @@ def _transcribe_entry(entry: dict, crop_by_qnum: dict, model: str,
         source = f"missing crop ({reason})"
 
     return {
-        "question_num":  str(q_num),
-        "question_text": sanitize(latex_to_unicode(q_text)),
-        "answers":       sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
-        "figures":       ", ".join(os.path.basename(p) for p in figs),
-        "source":        source,
+        "question_num":   str(q_num),
+        "question_text":  sanitize(latex_to_unicode(q_text)),
+        "question_image": crop_name,
+        "figures":        ", ".join(os.path.basename(p) for p in figs),
+        "answers":        sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
+        "source":         source,
     }
 
 
@@ -751,12 +924,51 @@ def _transcribe_all_parallel(mapping: list, crop_by_qnum: dict, model: str,
     return [f.result() for f in futures]
 
 
+_VAL_FILLS = {
+    "OK":             PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
+    "Missing Answer": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+    "Missing Text":   PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid"),
+    "Missing Both":   PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+}
+_VAL_FONTS = {
+    "OK":             Font(color="006100", bold=True),
+    "Missing Answer": Font(color="9C6500", bold=True),
+    "Missing Text":   Font(color="974706", bold=True),
+    "Missing Both":   Font(color="9C0006", bold=True),
+}
+
+
+def _validate_extraction(result: list) -> dict:
+    """Check each result entry for question text and answer completeness.
+
+    Adds a 'validation' field to every entry in-place.
+    Returns counts: {total, ok, missing_answer, missing_text, missing_both}.
+    """
+    counts = {"total": len(result), "ok": 0,
+              "missing_answer": 0, "missing_text": 0, "missing_both": 0}
+    for entry in result:
+        text = str(entry.get("question_text", "")).strip()
+        ans  = str(entry.get("answers",       "")).strip()
+        has_text = bool(text) and text.lower() not in ("nan", "none", "") and len(text) > 5
+        has_ans  = bool(ans)  and ans.lower()  not in ("nan", "none", "n/a", "")
+        if has_text and has_ans:
+            entry["validation"] = "OK";             counts["ok"]             += 1
+        elif has_text:
+            entry["validation"] = "Missing Answer"; counts["missing_answer"] += 1
+        elif has_ans:
+            entry["validation"] = "Missing Text";   counts["missing_text"]   += 1
+        else:
+            entry["validation"] = "Missing Both";   counts["missing_both"]   += 1
+    return counts
+
+
 def _write_questions_excel(result: list, output_path: str) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "Questions"
 
-    ws.append(["question_num", "question_text", "figures", "answers", "source"])
+    ws.append(["question_num", "question_text", "question_image",
+               "figures", "answers", "source", "validation"])
     header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
     for cell in ws[1]:
@@ -764,27 +976,238 @@ def _write_questions_excel(result: list, output_path: str) -> None:
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
+    _MULTI_NL = _re.compile(r'\n{3,}')
+
+    def _clean_text(text) -> str:
+        """Collapse 3+ consecutive newlines to 2 and strip leading/trailing whitespace."""
+        return _MULTI_NL.sub('\n\n', str(text).strip())
+
     vision_fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
     for entry in result:
-        source = entry.get("source", "")
-        ws.append([entry["question_num"], entry["question_text"],
-                   entry["figures"], entry["answers"], source])
+        source     = entry.get("source", "")
+        validation = entry.get("validation", "")
+        q_text     = _clean_text(entry.get("question_text", ""))
+        ws.append([
+            entry["question_num"],
+            q_text,
+            entry.get("question_image", ""),
+            entry.get("figures", ""),
+            entry["answers"],
+            source,
+            validation,
+        ])
         row = ws.max_row
+
+        # Cap row height: 15 pt per line, minimum 20 pt, maximum 150 pt.
+        # Prevents extremely tall rows when question text has many newlines.
+        line_count = q_text.count('\n') + 1
+        ws.row_dimensions[row].height = max(20, min(line_count * 15, 150))
+
         ws.cell(row, 1).alignment = Alignment(horizontal="center", vertical="top")
         ws.cell(row, 2).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
-        ws.cell(row, 3).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
-        ws.cell(row, 4).alignment = Alignment(horizontal="center", vertical="center")
-        ws.cell(row, 5).alignment = Alignment(horizontal="left",   vertical="center")
+        ws.cell(row, 3).alignment = Alignment(horizontal="center", vertical="center")
+        ws.cell(row, 4).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+        ws.cell(row, 5).alignment = Alignment(horizontal="center", vertical="center")
+        ws.cell(row, 6).alignment = Alignment(horizontal="left",   vertical="center")
+        ws.cell(row, 7).alignment = Alignment(horizontal="center", vertical="center")
         if source.startswith("vision"):
-            for col in range(1, 6):
+            for col in range(1, 8):
                 ws.cell(row, col).fill = vision_fill
+        if validation in _VAL_FILLS:
+            ws.cell(row, 7).fill = _VAL_FILLS[validation]
+            ws.cell(row, 7).font = _VAL_FONTS[validation]
 
     ws.column_dimensions['A'].width = 14
     ws.column_dimensions['B'].width = 70
-    ws.column_dimensions['C'].width = 35
-    ws.column_dimensions['D'].width = 18
-    ws.column_dimensions['E'].width = 28
+    ws.column_dimensions['C'].width = 28
+    ws.column_dimensions['D'].width = 35
+    ws.column_dimensions['E'].width = 18
+    ws.column_dimensions['F'].width = 28
+    ws.column_dimensions['G'].width = 18
+
+    # ── Summary sheet ─────────────────────────────────────────────────────────
+    sv = wb.create_sheet("Validation Summary")
+    sv_header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    sv_header_font = Font(color="FFFFFF", bold=True)
+
+    sv.append(["Metric", "Count", "Percentage"])
+    for cell in sv[1]:
+        cell.fill = sv_header_fill
+        cell.font = sv_header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    total = len(result)
+    pct = lambda n: f"{round(n / total * 100, 1)}%" if total else "0%"
+
+    ok_count  = sum(1 for e in result if e.get("validation") == "OK")
+    ma_count  = sum(1 for e in result if e.get("validation") == "Missing Answer")
+    mt_count  = sum(1 for e in result if e.get("validation") == "Missing Text")
+    mb_count  = sum(1 for e in result if e.get("validation") == "Missing Both")
+
+    rows = [
+        ("Total questions",      total,    "100%"),
+        ("OK (text + answer)",   ok_count, pct(ok_count)),
+        ("Missing Answer",       ma_count, pct(ma_count)),
+        ("Missing Text",         mt_count, pct(mt_count)),
+        ("Missing Both",         mb_count, pct(mb_count)),
+    ]
+    fill_map = {
+        "OK (text + answer)": _VAL_FILLS["OK"],
+        "Missing Answer":     _VAL_FILLS["Missing Answer"],
+        "Missing Text":       _VAL_FILLS["Missing Text"],
+        "Missing Both":       _VAL_FILLS["Missing Both"],
+    }
+    for label, count, pct_str in rows:
+        sv.append([label, count, pct_str])
+        row_idx = sv.max_row
+        if label in fill_map:
+            for col in range(1, 4):
+                sv.cell(row_idx, col).fill = fill_map[label]
+        for col in range(1, 4):
+            sv.cell(row_idx, col).alignment = Alignment(horizontal="center" if col > 1 else "left")
+
+    sv.column_dimensions['A'].width = 26
+    sv.column_dimensions['B'].width = 10
+    sv.column_dimensions['C'].width = 12
+
+    # ── List of problem questions ──────────────────────────────────────────────
+    problems = [e for e in result if e.get("validation") != "OK"]
+    if problems:
+        sv.append([])
+        sv.append(["Problem Questions", "Validation Status"])
+        hdr_row = sv.max_row
+        for col in (1, 2):
+            sv.cell(hdr_row, col).fill = sv_header_fill
+            sv.cell(hdr_row, col).font = sv_header_font
+            sv.cell(hdr_row, col).alignment = Alignment(horizontal="center")
+        for e in problems:
+            sv.append([e["question_num"], e.get("validation", "")])
+            row_idx = sv.max_row
+            v = e.get("validation", "")
+            if v in _VAL_FILLS:
+                sv.cell(row_idx, 2).fill = _VAL_FILLS[v]
+                sv.cell(row_idx, 2).font = _VAL_FONTS[v]
+            sv.cell(row_idx, 2).alignment = Alignment(horizontal="center")
+
     wb.save(output_path)
+
+
+def _render_full_pages(pdf_path: str, output_dir: str) -> list[str]:
+    """Render every page of pdf_path to a PNG at 150 dpi. Returns list of file paths."""
+    import fitz as _fitz
+    _mat = _fitz.Matrix(150 / 72, 150 / 72)
+    doc   = _fitz.open(pdf_path)
+    paths = []
+    for i, page in enumerate(doc):
+        out = os.path.join(output_dir, f"page_{i + 1:03d}.png")
+        page.get_pixmap(matrix=_mat).save(out)
+        paths.append(out)
+    doc.close()
+    return paths
+
+
+def _detect_separator_lines(img_path: str,
+                             dark_threshold: int = 100,
+                             min_dark_frac: float = 0.50) -> list:
+    """Return y-pixel positions of horizontal separator lines in a page PNG.
+
+    A separator is a contiguous band of rows where >= min_dark_frac of pixels
+    are darker than dark_threshold.  Returns centres of those bands.
+    """
+    import numpy as _np
+    from PIL import Image as _PILImage
+    img = _np.array(_PILImage.open(img_path).convert('L'))
+    h, w = img.shape
+    dark_frac = (img < dark_threshold).sum(axis=1) / w
+    lines = []
+    in_line = False
+    line_start = 0
+    for y in range(h):
+        if dark_frac[y] >= min_dark_frac:
+            if not in_line:
+                in_line = True
+                line_start = y
+        else:
+            if in_line:
+                in_line = False
+                lines.append((line_start + y) // 2)
+    if in_line:
+        lines.append((line_start + h) // 2)
+    return lines
+
+
+def _crop_question_by_separators(page_img_path: str, y_top: int, y_bot: int,
+                                  sep_lines: list, out_path: str,
+                                  pad: int = 6) -> bool:
+    """Crop a question region using the nearest separator lines as boundaries.
+
+    y_top: approximate y of the question label in full-res pixels.
+    y_bot: approximate y of the NEXT question label (or page height).
+    sep_lines: sorted separator y-positions detected in the full-res page image.
+    Returns True when a usable crop was saved.
+    """
+    from PIL import Image as _PILImage
+    img = _PILImage.open(page_img_path)
+    h = img.height
+
+    # Top boundary: last separator that sits at or just above y_top
+    above = [l for l in sep_lines if l <= y_top + 30]
+    top = (max(above) + pad) if above else max(0, y_top - pad)
+
+    # Bottom boundary: first separator at or just below y_bot
+    below = [l for l in sep_lines if l >= y_bot - 30]
+    bottom = (min(below) - pad) if below else min(h, y_bot + pad)
+
+    if bottom - top < 30:
+        return False
+
+    img.crop((0, top, img.width, bottom)).save(out_path)
+    return True
+
+
+def _crop_questions_by_separators(result: list, crop_by_qnum: dict,
+                                   questions_dir: str) -> None:
+    """Post-process vision results: replace full-page refs with per-question crops.
+
+    Must be called AFTER _render_full_pages has saved page_NNN.png files.
+    Modifies result entries in-place; adds per-question crops to crop_by_qnum.
+    _page_idx / _y_px fields must be present in each result entry.
+    """
+    # Scale factor: _render_all_pages uses scale=1.0 (72 dpi equivalent);
+    # _render_full_pages uses 150 dpi → multiply by 150/72.
+    _SCALE = 150 / 72
+
+    from collections import defaultdict as _dd
+    by_page: dict = _dd(list)
+    for entry in result:
+        if "_page_idx" in entry:
+            by_page[entry["_page_idx"]].append(entry)
+
+    for page_idx, entries in by_page.items():
+        page_png = os.path.join(questions_dir, f"page_{page_idx + 1:03d}.png")
+        if not os.path.exists(page_png):
+            continue
+
+        sep_lines = _detect_separator_lines(page_png)
+        if not sep_lines:
+            continue  # no separator lines found — keep full-page reference
+
+        from PIL import Image as _PILImage
+        page_h = _PILImage.open(page_png).height
+
+        entries.sort(key=lambda e: e.get("_y_px", 0))
+
+        for i, entry in enumerate(entries):
+            y_top = int(entry.get("_y_px", 0) * _SCALE)
+            y_bot = int(entries[i + 1].get("_y_px", 0) * _SCALE) if i + 1 < len(entries) else page_h
+
+            q_id     = entry["question_num"]
+            out_path = os.path.join(questions_dir, f"q_{q_id}.png")
+
+            ok = _crop_question_by_separators(page_png, y_top, y_bot, sep_lines, out_path)
+            if ok:
+                entry["question_image"] = f"questions/q_{q_id}.png"
+                crop_by_qnum[q_id]      = out_path
 
 
 @app.route('/api/pdf-to-images', methods=['POST'])
@@ -809,33 +1232,31 @@ def pdf_to_images():
         model = request.form.get("model", "haiku")
         questions_dir, _ = _prepare_work_dirs(os.getcwd())
 
-        # Detect and crop questions — text-based first, vision fallback for scanned PDFs
+        # Detect and crop questions — map-first for text PDFs, vision fallback for scanned
         pdf_texts = extract_question_texts_from_pdf(questions_path)
         answers_dict_vision: dict = {}
         if pdf_texts:
-            crop_by_qnum = crop_questions_from_pdf(questions_path, questions_dir)
+            # Build the Q↔A map upfront so boundaries and answers are known before cropping
+            _answers_path_for_map = answers_path or questions_path
+            pdf_map      = build_pdf_map(questions_path, _answers_path_for_map)
+            crop_by_qnum = crop_from_map(questions_path, questions_dir, pdf_map)
+            map_by_qnum  = {e["question_num"]: e for e in pdf_map}
         else:
             crop_by_qnum, answers_dict_vision = _crop_questions_vision(questions_path, questions_dir, model)
-            pdf_texts = {}
-
-        # Extract answers from answers PDF if provided
-        answers_list = []
-        if answers_path:
-            try:
-                processor = PDFProcessor(questions_path, answers_path)
-                answers_list = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
-            except Exception:
-                answers_list = []
+            pdf_texts   = {}
+            pdf_map     = []
+            map_by_qnum = {}
 
         # Build mapping for the transcription pipeline.
-        # Priority: explicit answers PDF → vision-extracted answers → N/A
+        # Text path: answers come from the pre-built map (already paired with questions).
+        # Vision path: answers come from vision extraction or N/A.
         mapping = [
             {
                 "question_num": q_num,
-                "figure": None,
+                "figure":       None,
                 "answer": (
-                    answers_list[q_num - 1]
-                    if answers_list and 0 < q_num <= len(answers_list)
+                    map_by_qnum[q_num]["answer"]
+                    if q_num in map_by_qnum
                     else sanitize(latex_to_unicode(str(answers_dict_vision.get(q_num, "N/A"))))
                 ),
             }
@@ -846,17 +1267,23 @@ def pdf_to_images():
         # falls back to Claude vision only for scanned/unreadable questions.
         result = _transcribe_all_parallel(mapping, crop_by_qnum, model, pdf_texts)
 
+        _validate_extraction(result)
+
         # Write full Excel (same format as extract-single)
         excel_path = os.path.join(app.config['UPLOAD_FOLDER'], 'extraction_results.xlsx')
         _write_questions_excel(result, excel_path)
 
-        # Bundle: all question images + Excel into one ZIP
-        zip_path = os.path.join(app.config['UPLOAD_FOLDER'], 'question_crops.zip')
+        # Bundle: full page images + question crops + Excel into one ZIP
+        page_pngs = _render_full_pages(questions_path, questions_dir)
+        zip_path  = os.path.join(app.config['UPLOAD_FOLDER'], 'question_crops.zip')
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for p in page_pngs:
+                if os.path.exists(p):
+                    zf.write(p, f"pages/{os.path.basename(p)}")
             for q_num in sorted(crop_by_qnum.keys()):
                 path = crop_by_qnum[q_num]
                 if os.path.exists(path):
-                    zf.write(path, os.path.basename(path))
+                    zf.write(path, f"questions/{os.path.basename(path)}")
             zf.write(excel_path, 'extraction_results.xlsx')
 
         response = send_file(
@@ -899,23 +1326,41 @@ def extract_single():
         questions_dir, figures_dir = _prepare_work_dirs(os.getcwd())
         crop_by_qnum, mapping = _run_pdf_pipeline(pdf_path, pdf_path, questions_dir, figures_dir)
 
-        if not mapping:
-            result = _vision_pipeline_for_scanned_pdf(pdf_path, questions_dir, model)
+        vision_path = not bool(mapping)
+        if vision_path:
+            # Scanned PDF: vision extracts Q text + links each question to its full page PNG.
+            result, crop_by_qnum = _vision_pipeline_for_scanned_pdf(pdf_path, questions_dir, model)
         else:
             pdf_texts = extract_question_texts_from_pdf(pdf_path)
             result = _transcribe_all_parallel(mapping, crop_by_qnum, model, pdf_texts)
 
+        # Render full-res pages (150 dpi) for the ZIP and — on vision path —
+        # use them to crop each question between its separator lines.
+        page_pngs = _render_full_pages(pdf_path, questions_dir)
+        if vision_path:
+            _crop_questions_by_separators(result, crop_by_qnum, questions_dir)
+
+        # Strip pipeline-internal fields before writing Excel.
+        for _e in result:
+            _e.pop("_page_idx", None)
+            _e.pop("_y_px", None)
+
+        _validate_extraction(result)
+
         excel_path = os.path.join(app.config['UPLOAD_FOLDER'], 'single_pdf_output.xlsx')
         _write_questions_excel(result, excel_path)
 
-        # Bundle Excel + all cropped question images into one ZIP
+        # Bundle: full page images + per-question crops (vision or text) + Excel.
         zip_path = os.path.join(app.config['UPLOAD_FOLDER'], 'single_pdf_output.zip')
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            zf.write(excel_path, 'extraction_results.xlsx')
+            for p in page_pngs:
+                if os.path.exists(p):
+                    zf.write(p, f"pages/{os.path.basename(p)}")
             for q_num in sorted(crop_by_qnum.keys()):
                 crop_path = crop_by_qnum[q_num]
                 if os.path.exists(crop_path):
-                    zf.write(crop_path, os.path.basename(crop_path))
+                    zf.write(crop_path, f"questions/{os.path.basename(crop_path)}")
+            zf.write(excel_path, 'extraction_results.xlsx')
 
         response = send_file(
             zip_path,
@@ -937,7 +1382,9 @@ def extract_single():
 
 
 def _transcribe_entry_mathpix(entry: dict, crop_by_qnum: dict, model: str) -> dict:
-    crop_path = crop_by_qnum.get(entry["question_num"])
+    q_num     = entry["question_num"]
+    crop_path = crop_by_qnum.get(q_num)
+    crop_name = os.path.basename(crop_path) if crop_path else ""
     figs = entry.get("figure") or []
     if crop_path and os.path.exists(crop_path):
         try:
@@ -947,10 +1394,11 @@ def _transcribe_entry_mathpix(entry: dict, crop_by_qnum: dict, model: str) -> di
     else:
         q_text = ""
     return {
-        "question_num":  str(entry["question_num"]),
-        "question_text": sanitize(latex_to_unicode(q_text)),
-        "answers":       sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
-        "figures":       ", ".join(os.path.basename(p) for p in figs),
+        "question_num":   str(q_num),
+        "question_text":  sanitize(latex_to_unicode(q_text)),
+        "question_image": crop_name,
+        "figures":        ", ".join(os.path.basename(p) for p in figs),
+        "answers":        sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
     }
 
 

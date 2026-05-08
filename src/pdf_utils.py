@@ -86,6 +86,21 @@ _DPI = 150
 _MAT = fitz.Matrix(_DPI / 72, _DPI / 72)
 
 
+def _stitch_vertical(pixmaps: list, out_path: str) -> None:
+    """Vertically concatenate PyMuPDF Pixmap objects and save as a single PNG."""
+    from PIL import Image as _PILImage
+    import io
+    pil_imgs = [_PILImage.open(io.BytesIO(px.tobytes("png"))) for px in pixmaps]
+    total_w = max(img.width for img in pil_imgs)
+    total_h = sum(img.height for img in pil_imgs)
+    canvas = _PILImage.new("RGB", (total_w, total_h), "white")
+    y_off = 0
+    for img in pil_imgs:
+        canvas.paste(img, (0, y_off))
+        y_off += img.height
+    canvas.save(out_path)
+
+
 def pdf_pages_to_png(pdf_path: str, output_dir: str, prefix: str) -> list:
     """Render every page of a PDF to a PNG file and return the list of saved paths."""
     doc = fitz.open(pdf_path)
@@ -185,6 +200,119 @@ def build_question_mapping(questions_path: str, answers_path: str, fig_data: lis
             "answer":       answers_list[q_num - 1] if q_num - 1 < len(answers_list) else "N/A",
         })
     return mapping
+
+
+def build_pdf_map(questions_path: str, answers_path: str) -> list:
+    """Detect all question boundaries and pair with answers before image generation.
+
+    Returns [{"question_num", "start_page", "start_y", "end_page", "end_y",
+               "spans_pages", "answer"}, ...] in reading order.
+    """
+    doc = fitz.open(questions_path)
+    pattern = _detect_q_pattern(doc)
+    markers = []
+    expected_num = None
+    for page_idx, page in enumerate(doc):
+        blocks = sorted(page.get_text("blocks"), key=lambda b: (b[1], b[0]))
+        for block in blocks:
+            if block[6] != 0:
+                continue
+            first_line = block[4].strip().split('\n')[0]
+            m = pattern.match(first_line)
+            if not m:
+                continue
+            num = _q_num(m)
+            if expected_num is None or num == expected_num:
+                markers.append((num, page_idx, block[1]))
+                expected_num = num + 1
+
+    last_page_idx = len(doc) - 1
+    last_page_h   = doc[last_page_idx].rect.height
+    doc.close()
+
+    processor    = PDFProcessor(questions_path, answers_path)
+    answers_list = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
+
+    pdf_map = []
+    for q_idx, (q_num, page_idx, y_top) in enumerate(markers):
+        if q_idx + 1 < len(markers):
+            _, next_page_idx, next_y = markers[q_idx + 1]
+        else:
+            next_page_idx = last_page_idx
+            next_y        = last_page_h
+
+        pdf_map.append({
+            "question_num": q_num,
+            "start_page":   page_idx,
+            "start_y":      y_top,
+            "end_page":     next_page_idx,
+            "end_y":        next_y,
+            "spans_pages":  next_page_idx != page_idx,
+            "answer":       answers_list[q_num - 1] if q_num - 1 < len(answers_list) else "N/A",
+        })
+    return pdf_map
+
+
+def crop_from_map(pdf_path: str, output_dir: str, pdf_map: list) -> dict:
+    """Crop each question to its own PNG using a pre-built boundary map.
+
+    Returns {q_num: png_path}. Reuses _content_bottom and _stitch_vertical.
+    """
+    doc   = fitz.open(pdf_path)
+    crops = {}
+
+    for entry in pdf_map:
+        q_num         = entry["question_num"]
+        page_idx      = entry["start_page"]
+        y_top         = entry["start_y"]
+        next_page_idx = entry["end_page"]
+        next_y        = entry["end_y"]
+        out_path      = os.path.join(output_dir, f'question_{q_num:03d}.png')
+        page_a        = doc[page_idx]
+
+        if not entry["spans_pages"]:
+            # ── Same-page ────────────────────────────────────────────────────
+            raw_bottom = _content_bottom(page_a, y_top, next_y)
+            y0 = max(0.0, y_top - 5)
+            y1 = min(page_a.rect.height, raw_bottom + 5)
+            if y1 - y0 < 1:
+                continue
+            pix = page_a.get_pixmap(matrix=_MAT,
+                                    clip=fitz.Rect(0, y0, page_a.rect.width, y1))
+            pix.save(out_path)
+        else:
+            # ── Cross-page: stitch segments ──────────────────────────────────
+            segments = []
+
+            raw_bot_a = _content_bottom(page_a, y_top, page_a.rect.height)
+            y0_a = max(0.0, y_top - 5)
+            y1_a = min(page_a.rect.height, raw_bot_a + 5)
+            if y1_a - y0_a >= 1:
+                segments.append(page_a.get_pixmap(
+                    matrix=_MAT,
+                    clip=fitz.Rect(0, y0_a, page_a.rect.width, y1_a),
+                ))
+
+            for mid_idx in range(page_idx + 1, next_page_idx):
+                segments.append(doc[mid_idx].get_pixmap(matrix=_MAT))
+
+            page_c    = doc[next_page_idx]
+            raw_bot_c = _content_bottom(page_c, 0.0, next_y)
+            y1_c      = min(next_y, raw_bot_c + 5)
+            if y1_c >= 1:
+                segments.append(page_c.get_pixmap(
+                    matrix=_MAT,
+                    clip=fitz.Rect(0, 0, page_c.rect.width, y1_c),
+                ))
+
+            if not segments:
+                continue
+            _stitch_vertical(segments, out_path)
+
+        crops[q_num] = out_path
+
+    doc.close()
+    return crops
 
 
 def extract_figures_per_question(pdf_path: str, output_base_dir: str) -> dict:
@@ -295,26 +423,55 @@ def extract_question_texts_from_pdf(pdf_path: str) -> dict:
 
     texts = {}
     for q_idx, (q_num, page_idx, y_top) in enumerate(markers):
-        page = doc[page_idx]
-        page_rect = page.rect
+        page_a = doc[page_idx]
 
         if q_idx + 1 < len(markers):
-            next_q_num, next_page_idx, next_y = markers[q_idx + 1]
-            y_limit = next_y if next_page_idx == page_idx else page_rect.height
+            _, next_page_idx, next_y = markers[q_idx + 1]
         else:
-            y_limit = page_rect.height
+            next_page_idx = len(doc) - 1
+            next_y = doc[next_page_idx].rect.height
 
-        y0 = max(0.0, y_top - 2)
-        raw_bottom = _content_bottom(page, y_top, y_limit)
-        y1 = min(page_rect.height, raw_bottom + 2)
+        if next_page_idx == page_idx:
+            # ── Same-page case ────────────────────────────────────────────────
+            y0 = max(0.0, y_top - 2)
+            raw_bottom = _content_bottom(page_a, y_top, next_y)
+            y1 = min(page_a.rect.height, raw_bottom + 2)
+            if y1 - y0 < 1:
+                continue
+            text = page_a.get_text("text", clip=fitz.Rect(0.0, y0, page_a.rect.width, y1)).strip()
+            if text:
+                texts[q_num] = text
+        else:
+            # ── Cross-page case: collect text across multiple pages ────────────
+            parts = []
 
-        if y1 - y0 < 1:
-            continue
+            # Part A: from question marker to bottom of starting page
+            y0_a = max(0.0, y_top - 2)
+            raw_bot_a = _content_bottom(page_a, y_top, page_a.rect.height)
+            y1_a = min(page_a.rect.height, raw_bot_a + 2)
+            if y1_a - y0_a >= 1:
+                t = page_a.get_text("text", clip=fitz.Rect(0.0, y0_a, page_a.rect.width, y1_a)).strip()
+                if t:
+                    parts.append(t)
 
-        clip = fitz.Rect(0.0, y0, page_rect.width, y1)
-        text = page.get_text("text", clip=clip).strip()
-        if text:
-            texts[q_num] = text
+            # Part B: full intermediate pages
+            for mid_idx in range(page_idx + 1, next_page_idx):
+                t = doc[mid_idx].get_text("text").strip()
+                if t:
+                    parts.append(t)
+
+            # Part C: top of next question's page up to (not including) next question
+            page_c = doc[next_page_idx]
+            raw_bot_c = _content_bottom(page_c, 0.0, next_y)
+            y1_c = min(next_y, raw_bot_c + 2)
+            if y1_c >= 1:
+                t = page_c.get_text("text", clip=fitz.Rect(0.0, 0.0, page_c.rect.width, y1_c)).strip()
+                if t:
+                    parts.append(t)
+
+            text = "\n".join(parts)
+            if text:
+                texts[q_num] = text
 
     doc.close()
     return texts
@@ -377,33 +534,58 @@ def crop_questions_from_pdf(pdf_path: str, output_dir: str) -> dict:
         return crops
 
     for q_idx, (q_num, page_idx, y_top) in enumerate(markers):
-        page = doc[page_idx]
-        page_rect = page.rect
+        page_a = doc[page_idx]
 
-        # y_limit: hard upper boundary — the start of the next question (or page bottom).
-        # Used only to scope the content search; the actual crop bottom is tighter.
         if q_idx + 1 < len(markers):
-            next_q_num, next_page_idx, next_y = markers[q_idx + 1]
-            y_limit = next_y if next_page_idx == page_idx else page_rect.height
+            _, next_page_idx, next_y = markers[q_idx + 1]
         else:
-            y_limit = page_rect.height
+            next_page_idx = len(doc) - 1
+            next_y = doc[next_page_idx].rect.height
 
-        x0 = 0.0
-        y0 = max(0.0, y_top - 5)
-        x1 = page_rect.width
-
-        # Tighten the bottom to the last content block (text or image) so the
-        # crop contains only the question + options, not the gap before the next question.
-        raw_bottom = _content_bottom(page, y_top, y_limit)
-        y1 = min(page_rect.height, raw_bottom + 5)
-
-        if y1 - y0 < 1 or x1 - x0 < 1:
-            continue
-
-        clip = fitz.Rect(x0, y0, x1, y1)
-        pix = page.get_pixmap(matrix=_MAT, clip=clip)
         out_path = os.path.join(output_dir, f'question_{q_num:03d}.png')
-        pix.save(out_path)
+
+        if next_page_idx == page_idx:
+            # ── Same-page case ────────────────────────────────────────────────
+            raw_bottom = _content_bottom(page_a, y_top, next_y)
+            y0 = max(0.0, y_top - 5)
+            y1 = min(page_a.rect.height, raw_bottom + 5)
+            if y1 - y0 < 1:
+                continue
+            pix = page_a.get_pixmap(matrix=_MAT, clip=fitz.Rect(0, y0, page_a.rect.width, y1))
+            pix.save(out_path)
+        else:
+            # ── Cross-page case: stitch segments from multiple pages ───────────
+            segments = []
+
+            # Segment A: from question marker to bottom of its starting page
+            raw_bot_a = _content_bottom(page_a, y_top, page_a.rect.height)
+            y0_a = max(0.0, y_top - 5)
+            y1_a = min(page_a.rect.height, raw_bot_a + 5)
+            if y1_a - y0_a >= 1:
+                segments.append(page_a.get_pixmap(
+                    matrix=_MAT,
+                    clip=fitz.Rect(0, y0_a, page_a.rect.width, y1_a),
+                ))
+
+            # Segment B: any full intermediate pages
+            for mid_idx in range(page_idx + 1, next_page_idx):
+                segments.append(doc[mid_idx].get_pixmap(matrix=_MAT))
+
+            # Segment C: top of next question's page up to (but not including) next question.
+            # Bounded strictly by next_y so no content from question N+1 leaks in.
+            page_c = doc[next_page_idx]
+            raw_bot_c = _content_bottom(page_c, 0.0, next_y)
+            y1_c = min(next_y, raw_bot_c + 5)
+            if y1_c >= 1:
+                segments.append(page_c.get_pixmap(
+                    matrix=_MAT,
+                    clip=fitz.Rect(0, 0, page_c.rect.width, y1_c),
+                ))
+
+            if not segments:
+                continue
+            _stitch_vertical(segments, out_path)
+
         crops[q_num] = out_path
 
     doc.close()

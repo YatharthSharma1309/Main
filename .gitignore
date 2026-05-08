@@ -38,3 +38,17 @@ n8n_workflow.json
 figures/
 questions/
 pipeline_output/
+
+# Logs
+*.log
+api_server.log
+frontend_server.log
+pipeline_outputserver.log
+
+# Playwright test output
+test-results/
+tests/playwright_results.json
+tests/test_output.json
+
+# Local Claude Code config
+.claude/
