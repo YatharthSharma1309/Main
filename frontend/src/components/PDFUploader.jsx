@@ -12,7 +12,7 @@ import './PDFUploader.css';
 
 const PDFUploader = () => {
   // State management
-  const [mode, setMode] = useState('extract');
+  const [mode, setMode] = useState('single-pdf');
   const [questionsPdf, setQuestionsPdf] = useState(null);
   const [answersPdf, setAnswersPdf] = useState(null);
   const [excelFile, setExcelFile] = useState(null);
